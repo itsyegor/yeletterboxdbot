@@ -1,13 +1,18 @@
 """
-Кинолента: Letterboxd подписок + рекомендации @msvetov из X -> закрытый Telegram-канал.
+Лента: бот собирает новое из разных источников и публикует в Telegram-каналы.
+Каждый источник привязывается к своему каналу (или нескольким) командой /bind <источник>.
+
+Источники:
+  letterboxd  просмотры людей, на которых ты подписан на Letterboxd
+  svetov      посты @msvetov в X с «рекомендую» / «не рекомендую»
+  kanoner     новости kanoner.com (строительство и город, Петербург)
 
 Переменные окружения (Railway -> Variables):
   TELEGRAM_TOKEN      токен бота от BotFather (обязательно)
   OWNER_ID            твой числовой Telegram id (обязательно)
-  TMDB_KEY            ключ TMDB (API Key или Read Access Token) - для названий на двух языках
-  ANTHROPIC_API_KEY   ключ Claude API - чтобы найти фильм в посте Светова
+  TMDB_KEY            ключ TMDB - названия фильмов на двух языках
+  ANTHROPIC_API_KEY   ключ Claude API - найти фильм в посте Светова
   X_AUTH_TOKEN, X_CT0 cookie из браузера, где ты залогинен в X
-  CHANNEL_ID          необязательно: id канала (иначе напиши /bind в канале)
   STATE_DIR           папка для памяти бота (по умолчанию /data - туда подключается volume)
 """
 import os
@@ -30,7 +35,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, Con
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logging.getLogger("httpx").setLevel(logging.WARNING)
-log = logging.getLogger("kinolenta")
+log = logging.getLogger("lenta")
 
 # ─── Настройки ──────────────────────────────────────────────────────────────
 
@@ -48,6 +53,8 @@ X_USER = os.environ.get("X_USER", "msvetov")
 X_AUTHOR_NAME = "Михаил Светов"
 LB_INTERVAL = float(os.environ.get("LB_INTERVAL_HOURS", "6")) * 3600
 X_INTERVAL = float(os.environ.get("X_INTERVAL_HOURS", "24")) * 3600
+KANONER_INTERVAL = float(os.environ.get("KANONER_INTERVAL_HOURS", "3")) * 3600
+KANONER_FEED = os.environ.get("KANONER_FEED", "https://kanoner.com/feed/")
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-5-5")
 
 # На случай, если Letterboxd не отдаст серверу страницу подписок
@@ -91,8 +98,26 @@ class State:
         self.data["lb"].setdefault("following", [])  # последний прочитанный список подписок
         self.data.setdefault("x", {})
         self.data["x"].setdefault("seen", [])
+        self.data.setdefault("kanoner", {})
+        self.data["kanoner"].setdefault("seen", [])
         self.data.setdefault("errors", {})
         self.data.setdefault("last", {})
+        self.data.setdefault("bindings", {})  # источник -> [id каналов]
+        self.data.setdefault("channel_titles", {})
+        self._migrate()
+
+    def _migrate(self):
+        """Старая версия: один канал на все. Переносим его на letterboxd и svetov."""
+        old = self.data.pop("channel_id", None)
+        if CHANNEL_ID_ENV and not old:
+            old = int(CHANNEL_ID_ENV) if re.fullmatch(r"-?\d+", CHANNEL_ID_ENV) else CHANNEL_ID_ENV
+        if old and not self.data["bindings"]:
+            self.data["bindings"] = {"letterboxd": [old], "svetov": [old]}
+        last = self.data["last"]
+        if "lb" in last:
+            last.setdefault("letterboxd", last.pop("lb"))
+        if "x" in last:
+            last.setdefault("svetov", last.pop("x"))
 
     def save(self):
         tmp = self.path + ".tmp"
@@ -100,11 +125,25 @@ class State:
             json.dump(self.data, f, ensure_ascii=False, indent=1)
         os.replace(tmp, self.path)
 
-    @property
-    def channel_id(self):
-        if CHANNEL_ID_ENV:
-            return int(CHANNEL_ID_ENV) if re.fullmatch(r"-?\d+", CHANNEL_ID_ENV) else CHANNEL_ID_ENV
-        return self.data.get("channel_id")
+    def channels(self, source):
+        return list(self.data["bindings"].get(source, []))
+
+    def bind(self, source, chat_id, title=None):
+        lst = self.data["bindings"].setdefault(source, [])
+        if chat_id not in lst:
+            lst.append(chat_id)
+        if title:
+            self.data["channel_titles"][str(chat_id)] = title
+        self.save()
+
+    def unbind(self, source, chat_id):
+        lst = self.data["bindings"].get(source, [])
+        if chat_id in lst:
+            lst.remove(chat_id)
+        self.save()
+
+    def title(self, chat_id):
+        return self.data["channel_titles"].get(str(chat_id), str(chat_id))
 
 
 state: State = None  # создается в main()
@@ -478,6 +517,19 @@ async def send_post(bot, client, chat_id, text_builder, images):
                       link_preview_options=LinkPreviewOptions(is_disabled=True))
 
 
+async def broadcast(bot, client, channels, text_builder, images):
+    """Один пост во все каналы источника. Ошибка в одном канале не мешает остальным."""
+    sent = 0
+    for chat_id in channels:
+        try:
+            await send_post(bot, client, chat_id, text_builder, images)
+            sent += 1
+        except Exception:
+            log.exception("Пост не ушел в канал %s", chat_id)
+    if channels and not sent:
+        raise RuntimeError("пост не ушел ни в один канал")
+
+
 async def notify_owner(bot, key, text):
     """Сообщение владельцу об ошибке, не чаще раза в сутки на источник."""
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -496,9 +548,9 @@ _lb_lock = asyncio.Lock()
 
 async def check_letterboxd(bot):
     async with _lb_lock:
-        chat_id = state.channel_id
-        if not chat_id:
-            log.warning("Канал не подключен: напиши /bind в канале")
+        channels = state.channels("letterboxd")
+        if not channels:
+            log.warning("letterboxd: нет канала, напиши /bind letterboxd в канале")
             return 0
         posted = 0
         failed = []
@@ -539,11 +591,11 @@ async def check_letterboxd(bot):
                         if len(chunk) == 1:
                             e = chunk[0]
                             titles, avg = infos[e["guid"]]
-                            await send_post(bot, client, chat_id,
+                            await broadcast(bot, client, channels,
                                             lambda lim, e=e, t=titles, a=avg: build_single(user, e, t, a, lim),
                                             [e["poster"]])
                         else:
-                            await send_post(bot, client, chat_id,
+                            await broadcast(bot, client, channels,
                                             lambda lim, c=chunk: build_group(user, c, infos, lim),
                                             [e["poster"] for e in chunk])
                         posted += 1
@@ -555,8 +607,8 @@ async def check_letterboxd(bot):
                     await asyncio.sleep(3)
 
         if failed and len(failed) == len(users):
-            await notify_owner(bot, "lb", "Кинолента: Letterboxd не отдает ленты. Проверю снова через 6 часов.")
-        state.data["last"]["lb"] = time.time()
+            await notify_owner(bot, "letterboxd", "Лента: Letterboxd не отдает ленты. Проверю снова через 6 часов.")
+        state.data["last"]["letterboxd"] = time.time()
         state.save()
         log.info("Letterboxd: %d постов", posted)
         return posted
@@ -676,8 +728,9 @@ async def check_x(bot, x_client=None):
     async with _x_lock:
         if not (X_AUTH_TOKEN and X_CT0) and x_client is None:
             return 0
-        chat_id = state.channel_id
-        if not chat_id:
+        channels = state.channels("svetov")
+        if not channels:
+            log.warning("svetov: нет канала, напиши /bind svetov в канале")
             return 0
         xs = state.data["x"]
         posted = 0
@@ -692,9 +745,9 @@ async def check_x(bot, x_client=None):
             tweets = list(await x_client.get_user_tweets(xs["user_id"], "Tweets", count=40))
         except Exception as e:
             log.exception("X недоступен")
-            await notify_owner(bot, "x", f"Кинолента: не получилось прочитать X ({type(e).__name__}). "
-                                         "Если повторится, скорее всего истекли cookie - обнови X_AUTH_TOKEN и X_CT0.")
-            state.data["last"]["x"] = time.time()
+            await notify_owner(bot, "svetov", f"Лента: не получилось прочитать X ({type(e).__name__}). "
+                                              "Если повторится, скорее всего истекли cookie - обнови X_AUTH_TOKEN и X_CT0.")
+            state.data["last"]["svetov"] = time.time()
             state.save()
             return 0
 
@@ -706,7 +759,7 @@ async def check_x(bot, x_client=None):
         if first_run:
             xs["seen"] = [str(t.id) for t in tweets][-SEEN_KEEP:]
             xs["initialized"] = True
-            state.data["last"]["x"] = time.time()
+            state.data["last"]["svetov"] = time.time()
             state.save()
             log.info("X: первый запуск, отмечено %d постов", len(tweets))
             return 0
@@ -739,7 +792,7 @@ async def check_x(bot, x_client=None):
                             images.append(m.media_url)
                             break
                 try:
-                    await send_post(bot, client, chat_id,
+                    await broadcast(bot, client, channels,
                                     lambda lim, tx=text, u=url, vv=v, f=film, g=guess:
                                         build_x_post(tx, u, vv, f, g, lim),
                                     images[:1])
@@ -749,28 +802,177 @@ async def check_x(bot, x_client=None):
                 state.save()
                 await asyncio.sleep(3)
 
-        state.data["last"]["x"] = time.time()
+        state.data["last"]["svetov"] = time.time()
         state.save()
         log.info("X: %d постов", posted)
         return posted
+
+# ─── Канонер ────────────────────────────────────────────────────────────────
+
+CONTENT_NS = "{http://purl.org/rss/1.0/modules/content/}encoded"
+
+def _first_image(html_text):
+    if not html_text:
+        return None
+    soup = BeautifulSoup(html_text, "html.parser")
+    for img in soup.find_all("img"):
+        src = img.get("src") or ""
+        if not src or "/imgst/" in src or src.endswith(".gif"):
+            continue  # служебные значки сайта
+        return src
+    return None
+
+
+def _plain(html_text):
+    soup = BeautifulSoup(html_text or "", "html.parser")
+    text = soup.get_text(" ").strip()
+    text = re.sub(r"\s+", " ", text)
+    # хвост, который WordPress дописывает в анонс
+    text = re.sub(r"\s*(Сообщение|Запись|The post)\s.*?(появились сначала|appeared first).*$", "", text)
+    text = re.sub(r"\s*(\[…\]|\[\.\.\.\]|Читать далее.*)$", "", text)
+    return text.strip()
+
+
+def parse_kanoner(xml_text):
+    root = ET.fromstring(xml_text)
+    out = []
+    for item in root.iter("item"):
+        link = (item.findtext("link") or "").strip()
+        guid = (item.findtext("guid") or link).strip()
+        if not guid:
+            continue
+        desc = item.findtext("description") or ""
+        content = item.findtext(CONTENT_NS) or ""
+        try:
+            pub = parsedate_to_datetime(item.findtext("pubDate")).timestamp()
+        except Exception:
+            pub = 0
+        out.append({
+            "guid": guid,
+            "title": html.unescape((item.findtext("title") or "").strip()),
+            "link": link,
+            "categories": [c.text.strip() for c in item.findall("category") if c.text and c.text.strip()],
+            "summary": _plain(desc) or _plain(content),
+            "image": _first_image(content) or _first_image(desc),
+            "pub": pub,
+        })
+    out.sort(key=lambda e: e["pub"])
+    return out
+
+
+async def og_image(client, url):
+    try:
+        r = await http_get(client, url)
+        m = re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)', r.text)
+        if m and "/imgst/" not in m.group(1):
+            return m.group(1)
+    except Exception as e:
+        log.info("og:image не получен для %s: %s", url, e)
+    return None
+
+
+def build_kanoner(e, limit):
+    lines = [f"<b>{esc(e['title'])}</b>"]
+    if e["categories"]:
+        lines.append(f"<i>{esc(' · '.join(e['categories'][:2]))}</i>")
+    if e["summary"] and limit:
+        lines.append("")
+        lines.append(esc(cut(e["summary"], min(limit, 600))))
+    lines.append("")
+    lines.append(f'<a href="{esc(e["link"])}">Читать на Канонере</a>')
+    return "\n".join(lines)
+
+
+_kanoner_lock = asyncio.Lock()
+
+async def check_kanoner(bot):
+    async with _kanoner_lock:
+        channels = state.channels("kanoner")
+        if not channels:
+            return 0
+        ks = state.data["kanoner"]
+        posted = 0
+        async with httpx.AsyncClient() as client:
+            try:
+                r = await http_get(client, KANONER_FEED)
+                entries = parse_kanoner(r.text)
+            except Exception as e:
+                log.exception("Канонер недоступен")
+                await notify_owner(bot, "kanoner", f"Лента: не получилось прочитать Канонер ({type(e).__name__}).")
+                state.data["last"]["kanoner"] = time.time()
+                state.save()
+                return 0
+
+            if not ks.get("initialized"):
+                ks["seen"] = [e["guid"] for e in entries][-SEEN_KEEP:]
+                ks["initialized"] = True
+                state.data["last"]["kanoner"] = time.time()
+                state.save()
+                log.info("Канонер: первый запуск, отмечено %d новостей", len(entries))
+                return 0
+
+            seen = set(ks["seen"])
+            for e in [x for x in entries if x["guid"] not in seen]:
+                image = e["image"] or await og_image(client, e["link"])
+                try:
+                    await broadcast(bot, client, channels, lambda lim, e=e: build_kanoner(e, lim), [image])
+                    posted += 1
+                except Exception:
+                    log.exception("Новость Канонера не отправлена")
+                    break
+                ks["seen"] = (ks["seen"] + [e["guid"]])[-SEEN_KEEP:]
+                state.save()
+                await asyncio.sleep(3)
+
+        state.data["last"]["kanoner"] = time.time()
+        state.save()
+        log.info("Канонер: %d постов", posted)
+        return posted
+
+# ─── Источники ──────────────────────────────────────────────────────────────
+# Новый источник = функция check_<имя>(bot) + строка здесь.
+
+SOURCES = {
+    "letterboxd": {"title": "Letterboxd: просмотры твоих подписок", "check": check_letterboxd, "every": LB_INTERVAL},
+    "svetov":     {"title": "Светов в X: «рекомендую» / «не рекомендую»", "check": check_x, "every": X_INTERVAL},
+    "kanoner":    {"title": "Канонер: стройка и город, Петербург", "check": check_kanoner, "every": KANONER_INTERVAL},
+}
+
+
+def hours(sec):
+    h = sec / 3600
+    return f"{h:g} ч"
 
 # ─── Расписание ─────────────────────────────────────────────────────────────
 
 async def scheduler(app):
     await asyncio.sleep(15)
     while True:
-        now = time.time()
-        try:
-            if now - state.data["last"].get("lb", 0) >= LB_INTERVAL:
-                await check_letterboxd(app.bot)
-            if now - state.data["last"].get("x", 0) >= X_INTERVAL:
-                await check_x(app.bot)
-        except Exception:
-            log.exception("Ошибка в расписании")
+        for name, src in SOURCES.items():
+            if not state.channels(name):
+                continue
+            if time.time() - state.data["last"].get(name, 0) < src["every"]:
+                continue
+            try:
+                await src["check"](app.bot)
+            except Exception:
+                log.exception("Ошибка в источнике %s", name)
+                state.data["last"][name] = time.time()
+                state.save()
         await asyncio.sleep(300)
 
 
 async def post_init(app):
+    # названия каналов, привязанных старой версией бота
+    for chat_id in {c for lst in state.data["bindings"].values() for c in lst}:
+        if str(chat_id) in state.data["channel_titles"]:
+            continue
+        try:
+            chat = await app.bot.get_chat(chat_id)
+            state.data["channel_titles"][str(chat_id)] = chat.title or str(chat_id)
+        except TelegramError:
+            pass
+    state.save()
     app.create_task(scheduler(app))
 
 # ─── Команды ────────────────────────────────────────────────────────────────
@@ -783,33 +985,44 @@ def owner_only(fn):
     return wrapper
 
 
+def sources_overview():
+    rows = []
+    for name, src in SOURCES.items():
+        chans = state.channels(name)
+        where = ", ".join(f"«{state.title(c)}»" for c in chans) if chans else "не подключен"
+        rows.append(f"• {name} — {src['title']}\n  каналы: {where}; проверка раз в {hours(src['every'])}")
+    return "\n".join(rows)
+
+
 @owner_only
 async def cmd_start(update, context):
     await update.message.reply_text(
-        "Кинолента работает.\n\n"
-        "/list - чьи ленты читаю\n"
-        "/add ник - добавить человека с Letterboxd\n"
-        "/remove ник - убрать\n"
-        "/check - проверить Letterboxd сейчас\n"
-        "/x - проверить Светова сейчас\n\n"
-        "Чтобы подключить канал: добавь меня в канал администратором и напиши в канале /bind"
+        "Лента: собираю новое из разных источников и публикую в твои каналы.\n\n"
+        "Источники:\n" + sources_overview() + "\n\n"
+        "Подключить источник к каналу: добавь меня в канал администратором и напиши в канале "
+        "/bind и название источника, например /bind kanoner. "
+        "Можно несколько сразу: /bind letterboxd svetov. Отключить: /unbind kanoner.\n\n"
+        "Команды здесь:\n"
+        "/list - источники, каналы и чьи ленты Letterboxd читаю\n"
+        "/check - проверить все источники сейчас (или /check kanoner)\n"
+        "/add ник, /remove ник - люди на Letterboxd"
     )
 
 
 @owner_only
 async def cmd_list(update, context):
     lb = state.data["lb"]
-    async with httpx.AsyncClient() as client:
-        users = await current_users(client)
-    state.save()
-    source = "из твоих подписок" if lb.get("following_ok") else "из сохраненного списка (страница подписок не открылась)"
-    text = f"Читаю {len(users)} лент, {source}:\n" + "\n".join(users)
-    if lb["added"]:
-        text += "\n\nДобавлены вручную: " + ", ".join(lb["added"])
-    if lb["removed"]:
-        text += "\nУбраны вручную: " + ", ".join(lb["removed"])
-    ch = state.channel_id
-    text += f"\n\nКанал: {'подключен' if ch else 'не подключен (напиши /bind в канале)'}"
+    text = "Источники:\n" + sources_overview()
+    if state.channels("letterboxd"):
+        async with httpx.AsyncClient() as client:
+            users = await current_users(client)
+        state.save()
+        origin = "из твоих подписок" if lb.get("following_ok") else "из сохраненного списка (страница подписок не открылась)"
+        text += f"\n\nLetterboxd, {len(users)} лент {origin}:\n" + "\n".join(users)
+        if lb["added"]:
+            text += "\nДобавлены вручную: " + ", ".join(lb["added"])
+        if lb["removed"]:
+            text += "\nУбраны вручную: " + ", ".join(lb["removed"])
     await update.message.reply_text(text)
 
 
@@ -822,7 +1035,7 @@ def clean_nick(arg):
 @owner_only
 async def cmd_add(update, context):
     if not context.args:
-        await update.message.reply_text("Напиши так: /add ник (или ссылку на профиль)")
+        await update.message.reply_text("Напиши так: /add ник (или ссылку на профиль Letterboxd)")
         return
     nick = clean_nick(context.args[0])
     lb = state.data["lb"]
@@ -831,7 +1044,7 @@ async def cmd_add(update, context):
     if nick not in lb["added"]:
         lb["added"].append(nick)
     state.save()
-    await update.message.reply_text(f"Добавил {nick}. Старые записи не пришлю, только новые.")
+    await update.message.reply_text(f"Добавил {nick} на Letterboxd. Старые записи не пришлю, только новые.")
 
 
 @owner_only
@@ -851,43 +1064,84 @@ async def cmd_remove(update, context):
 
 @owner_only
 async def cmd_check(update, context):
-    await update.message.reply_text("Проверяю Letterboxd...")
-    n = await check_letterboxd(context.bot)
-    await update.message.reply_text(f"Готово, новых постов: {n}.")
+    wanted = [a.lower() for a in context.args] or list(SOURCES)
+    unknown = [a for a in wanted if a not in SOURCES]
+    if unknown:
+        await update.message.reply_text("Таких источников нет: " + ", ".join(unknown) +
+                                        "\nЕсть: " + ", ".join(SOURCES))
+        return
+    lines = []
+    for name in wanted:
+        if not state.channels(name):
+            lines.append(f"{name}: не подключен к каналу")
+            continue
+        await update.message.reply_text(f"Проверяю {name}...")
+        try:
+            n = await SOURCES[name]["check"](context.bot)
+            lines.append(f"{name}: новых постов {n}")
+        except Exception as e:
+            log.exception("Ручная проверка %s", name)
+            lines.append(f"{name}: ошибка ({type(e).__name__})")
+    await update.message.reply_text("\n".join(lines))
 
 
 @owner_only
 async def cmd_x(update, context):
-    if not (X_AUTH_TOKEN and X_CT0):
-        await update.message.reply_text("Не заданы X_AUTH_TOKEN и X_CT0.")
-        return
-    await update.message.reply_text("Проверяю X...")
-    n = await check_x(context.bot)
-    await update.message.reply_text(f"Готово, новых постов: {n}.")
+    context.args = ["svetov"]
+    await cmd_check(update, context)
 
 
-async def channel_bind(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def channel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     post = update.channel_post
-    if not post or not post.text or not post.text.strip().startswith("/bind"):
+    if not post or not post.text:
         return
-    state.data["channel_id"] = post.chat.id
-    state.save()
+    parts = post.text.strip().split()
+    cmd = parts[0].split("@")[0].lower()
+    if cmd not in ("/bind", "/unbind"):
+        return
+    names = [p.lower() for p in parts[1:]]
+    if names == ["all"]:
+        names = list(SOURCES)
     try:
         await post.delete()
     except TelegramError:
         pass
-    await context.bot.send_message(post.chat.id, "Канал подключен. Новые просмотры будут появляться здесь.")
-    if OWNER_ID:
-        try:
-            await context.bot.send_message(OWNER_ID, f"Канал «{post.chat.title}» подключен.")
-        except TelegramError:
-            pass
+
+    async def tell_owner(text):
+        if OWNER_ID:
+            try:
+                await context.bot.send_message(OWNER_ID, text)
+            except TelegramError:
+                log.warning("Не смог написать владельцу (он нажимал /start у бота?)")
+
+    title = post.chat.title or str(post.chat.id)
+    if not names:
+        await tell_owner(f"В канале «{title}» напиши {cmd} и источник: " + ", ".join(SOURCES) +
+                         f". Например: {cmd} kanoner")
+        return
+    unknown = [n for n in names if n not in SOURCES]
+    names = [n for n in names if n in SOURCES]
+    for n in names:
+        if cmd == "/bind":
+            state.bind(n, post.chat.id, title)
+        else:
+            state.unbind(n, post.chat.id)
+    msg = []
+    if names:
+        verb = "подключен к каналу" if cmd == "/bind" else "отключен от канала"
+        msg.append(f"{', '.join(names)}: {verb} «{title}».")
+        if cmd == "/bind":
+            msg.append("Старое не пришлю, только то, что появится с этого момента.")
+    if unknown:
+        msg.append("Не знаю источники: " + ", ".join(unknown) + ". Есть: " + ", ".join(SOURCES))
+    await tell_owner(" ".join(msg))
 
 # ─── Запуск ─────────────────────────────────────────────────────────────────
 
 def main():
     global state
     state = State(STATE_DIR)
+    state.save()
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("list", cmd_list))
@@ -895,8 +1149,8 @@ def main():
     app.add_handler(CommandHandler("remove", cmd_remove))
     app.add_handler(CommandHandler("check", cmd_check))
     app.add_handler(CommandHandler("x", cmd_x))
-    app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST, channel_bind))
-    log.info("Кинолента запущена")
+    app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST, channel_command))
+    log.info("Лента запущена, источники: %s", ", ".join(SOURCES))
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
