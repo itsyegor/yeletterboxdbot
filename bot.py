@@ -25,6 +25,7 @@ import logging
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+from urllib.parse import urljoin
 
 import httpx
 from bs4 import BeautifulSoup
@@ -823,6 +824,10 @@ def _first_image(html_text):
     return None
 
 
+def _abs(base, url):
+    return urljoin(base or "https://kanoner.com/", full_size(url)) if url else None
+
+
 def _plain(html_text):
     soup = BeautifulSoup(html_text or "", "html.parser")
     text = soup.get_text(" ").strip()
@@ -853,21 +858,43 @@ def parse_kanoner(xml_text):
             "link": link,
             "categories": [c.text.strip() for c in item.findall("category") if c.text and c.text.strip()],
             "summary": _plain(desc) or _plain(content),
-            "image": _first_image(content) or _first_image(desc),
+            "image": _abs(link, _first_image(content) or _first_image(desc)),
             "pub": pub,
         })
     out.sort(key=lambda e: e["pub"])
     return out
 
 
-async def og_image(client, url):
+IMAGE_EXT = re.compile(r"\.(jpe?g|png|webp)(\?.*)?$", re.I)
+
+def full_size(url):
+    """WordPress-превью photo-400x200.jpg -> оригинал photo.jpg"""
+    return re.sub(r"-\d+x\d+(\.(?:jpe?g|png|webp))$", r"\1", url, flags=re.I)
+
+
+def article_image_from_html(page_html, page_url):
+    """Первое фото статьи: обложка страницы, иначе первая картинка из /pics/ в тексте."""
+    m = re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)', page_html)
+    if m and "/imgst/" not in m.group(1):
+        return urljoin(page_url, m.group(1))
+    soup = BeautifulSoup(page_html, "html.parser")
+    for img in soup.find_all("img"):
+        src = img.get("src") or ""
+        if "/pics/" not in src:
+            continue  # значки сайта, счетчики
+        a = img.find_parent("a")
+        if a and IMAGE_EXT.search(a.get("href") or ""):
+            return urljoin(page_url, a["href"])   # ссылка на полноразмерное фото
+        return urljoin(page_url, full_size(src))
+    return None
+
+
+async def article_image(client, url):
     try:
         r = await http_get(client, url)
-        m = re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)', r.text)
-        if m and "/imgst/" not in m.group(1):
-            return m.group(1)
+        return article_image_from_html(r.text, url)
     except Exception as e:
-        log.info("og:image не получен для %s: %s", url, e)
+        log.info("Фото статьи не получено для %s: %s", url, e)
     return None
 
 
@@ -913,7 +940,7 @@ async def check_kanoner(bot):
 
             seen = set(ks["seen"])
             for e in [x for x in entries if x["guid"] not in seen]:
-                image = e["image"] or await og_image(client, e["link"])
+                image = e["image"] or await article_image(client, e["link"])
                 try:
                     await broadcast(bot, client, channels, lambda lim, e=e: build_kanoner(e, lim), [image])
                     posted += 1
