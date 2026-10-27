@@ -464,7 +464,13 @@ async def tg_call(fn, *args, **kwargs):
 
 
 async def download(client, url):
-    r = await http_get(client, url)
+    # некоторые сайты (Канонер) отдают картинки только со ссылкой на свою страницу
+    p = httpx.URL(url)
+    r = await client.get(url, headers={**HEADERS, "Referer": f"{p.scheme}://{p.host}/"},
+                         follow_redirects=True, timeout=30)
+    r.raise_for_status()
+    if not r.headers.get("content-type", "").startswith("image/"):
+        raise ValueError(f"вместо картинки пришло {r.headers.get('content-type')}")
     return r.content
 
 
@@ -852,11 +858,16 @@ def parse_kanoner(xml_text):
             pub = parsedate_to_datetime(item.findtext("pubDate")).timestamp()
         except Exception:
             pub = 0
+        # номер статьи в адресе не меняется, когда сайт правит заголовок или текст
+        m = re.search(r"/\d{4}/\d{2}/\d{2}/(\d+)", link) or re.search(r"[?&]p=(\d+)", guid)
         out.append({
             "guid": guid,
+            "key": f"id:{m.group(1)}" if m else guid,
             "title": html.unescape((item.findtext("title") or "").strip()),
             "link": link,
-            "categories": [c.text.strip() for c in item.findall("category") if c.text and c.text.strip()],
+            # теги сайта вида «компания_кгиоп» не показываем, только рубрики
+            "categories": [c.text.strip() for c in item.findall("category")
+                           if c.text and c.text.strip() and "_" not in c.text],
             "summary": _plain(desc) or _plain(content),
             "image": _abs(link, _first_image(content) or _first_image(desc)),
             "pub": pub,
@@ -889,13 +900,59 @@ def article_image_from_html(page_html, page_url):
     return None
 
 
-async def article_image(client, url):
+def article_paragraphs(page_html):
+    """Абзацы текста статьи: после заголовка h1 и до «Смотрите также» / комментариев."""
+    soup = BeautifulSoup(page_html, "html.parser")
+    h1 = soup.find("h1")
+    if not h1:
+        return []
+    out = []
+    for p in h1.find_all_next(["p", "h2", "h3"]):
+        t = re.sub(r"\s+", " ", p.get_text(" ")).strip()
+        if p.name != "p" or re.match(r"(Смотрите также|Комментари|Изображения, прикрепленные)", t):
+            if out:
+                break
+            continue
+        if len(t) < 40 or t.startswith("Фото "):
+            continue
+        out.append(t)
+        if len(out) >= 4:
+            break
+    return out
+
+
+async def article_info(client, url):
+    """{'image': url или None, 'paragraphs': [...]} со страницы статьи."""
     try:
         r = await http_get(client, url)
-        return article_image_from_html(r.text, url)
+        return {"image": article_image_from_html(r.text, url), "paragraphs": article_paragraphs(r.text)}
     except Exception as e:
-        log.info("Фото статьи не получено для %s: %s", url, e)
-    return None
+        log.info("Статья не открылась %s: %s", url, e)
+    return {"image": None, "paragraphs": []}
+
+
+def _stems(text):
+    """Значимые слова по первым 5 буквам: «Митрофаньевского» и «Митрофаньевском» совпадут."""
+    return {w[:5] for w in re.findall(r"[а-яёa-z0-9]+", (text or "").lower()) if len(w) > 3}
+
+
+def _repeats(sentence, reference, share=0.5):
+    ref = _stems(reference)
+    return bool(ref) and len(_stems(sentence) & ref) >= max(2, share * len(ref))
+
+
+def summary_without_title(title, lead, paragraphs, want=200):
+    """Лид без предложений, пересказывающих заголовок; если мало - добавить абзац статьи."""
+    sentences = re.split(r"(?<=[.!?…])\s+", lead or "")
+    kept = [s for s in sentences if s and not _repeats(s, title)]
+    text = " ".join(kept).strip()
+    for p in paragraphs:
+        if len(text) >= want:
+            break
+        if _repeats(p, title) or (lead and _repeats(p, lead, 0.6)):
+            continue  # тот же лид или тот же заголовок
+        text = (text + " " + p).strip()
+    return text
 
 
 def build_kanoner(e, limit):
@@ -931,23 +988,42 @@ async def check_kanoner(bot):
                 return 0
 
             if not ks.get("initialized"):
-                ks["seen"] = [e["guid"] for e in entries][-SEEN_KEEP:]
+                ks["seen"] = [k for e in entries for k in (e["key"], e["guid"])][-SEEN_KEEP:]
                 ks["initialized"] = True
                 state.data["last"]["kanoner"] = time.time()
                 state.save()
                 log.info("Канонер: первый запуск, отмечено %d новостей", len(entries))
                 return 0
 
+            # уже отправленные: по номеру статьи; старые записи памяти хранили guid
             seen = set(ks["seen"])
-            for e in [x for x in entries if x["guid"] not in seen]:
-                image = e["image"] or await article_image(client, e["link"])
+            if not ks.get("keys_migrated"):
+                for e in entries:
+                    if e["guid"] in seen:
+                        seen.add(e["key"])
+                        ks["seen"].append(e["key"])
+                ks["keys_migrated"] = True
+                state.save()
+            fresh, keys = [], set()
+            for x in entries:
+                if x["key"] in seen or x["guid"] in seen or x["key"] in keys:
+                    continue
+                keys.add(x["key"])
+                fresh.append(x)
+
+            for e in fresh:
+                info = await article_info(client, e["link"])
+                image = e["image"] or info["image"]
+                if not image:
+                    log.info("Канонер: фото не найдено для %s", e["link"])
+                e["summary"] = summary_without_title(e["title"], e["summary"], info["paragraphs"])
                 try:
                     await broadcast(bot, client, channels, lambda lim, e=e: build_kanoner(e, lim), [image])
                     posted += 1
                 except Exception:
                     log.exception("Новость Канонера не отправлена")
                     break
-                ks["seen"] = (ks["seen"] + [e["guid"]])[-SEEN_KEEP:]
+                ks["seen"] = (ks["seen"] + [e["key"], e["guid"]])[-SEEN_KEEP:]
                 state.save()
                 await asyncio.sleep(3)
 
