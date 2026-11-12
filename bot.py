@@ -1139,7 +1139,14 @@ async def check_america(bot):
                             continue
                         commits.append(("feed", it["id"]))
                         if america.relevant(it["text"]):
-                            candidates.append({"source": feed["name"], "url": it["url"], "text": it["text"], "kind": "post"})
+                            # в RSS нет даты и места - они на странице события
+                            text = it["text"]
+                            try:
+                                ev_page = await http_get(client, it["url"])
+                                text = america.page_text(ev_page.text, str(ev_page.url), limit=6000)
+                            except Exception as e:
+                                log.info("Страница события не открылась %s: %s", it["url"], e)
+                            candidates.append({"source": feed["name"], "url": it["url"], "text": text, "kind": "post"})
                     ok.add(feed["url"])
                 except Exception as e:
                     failed[feed["url"]] = e
