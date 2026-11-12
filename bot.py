@@ -6,13 +6,15 @@
   letterboxd  просмотры людей, на которых ты подписан на Letterboxd
   svetov      посты @msvetov в X с «рекомендую» / «не рекомендую»
   kanoner     новости kanoner.com (строительство и город, Петербург)
+  america     анонсы очных лекций о США и Канаде в Петербурге (см. america.py)
 
 Переменные окружения (Railway -> Variables):
   TELEGRAM_TOKEN      токен бота от BotFather (обязательно)
   OWNER_ID            твой числовой Telegram id (обязательно)
   TMDB_KEY            ключ TMDB - названия фильмов на двух языках
-  ANTHROPIC_API_KEY   ключ Claude API - найти фильм в посте Светова
+  ANTHROPIC_API_KEY   ключ Claude API - найти фильм в посте Светова, отобрать лекции
   X_AUTH_TOKEN, X_CT0 cookie из браузера, где ты залогинен в X
+  TIMEPAD_TOKEN       токен Timepad, если API без него не пускает (необязательно)
   STATE_DIR           папка для памяти бота (по умолчанию /data - туда подключается volume)
 """
 import os
@@ -29,6 +31,8 @@ from urllib.parse import urljoin
 
 import httpx
 from bs4 import BeautifulSoup
+
+import america
 from telegram import Update, InputMediaPhoto, LinkPreviewOptions
 from telegram.constants import ParseMode
 from telegram.error import RetryAfter, TelegramError
@@ -57,6 +61,9 @@ X_INTERVAL = float(os.environ.get("X_INTERVAL_HOURS", "24")) * 3600
 KANONER_INTERVAL = float(os.environ.get("KANONER_INTERVAL_HOURS", "3")) * 3600
 KANONER_FEED = os.environ.get("KANONER_FEED", "https://kanoner.com/feed/")
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-5-5")
+AMERICA_INTERVAL = float(os.environ.get("AMERICA_INTERVAL_HOURS", "12")) * 3600
+AMERICA_MODEL = os.environ.get("AMERICA_MODEL", CLAUDE_MODEL)
+TIMEPAD_TOKEN = os.environ.get("TIMEPAD_TOKEN", "").strip()
 
 # На случай, если Letterboxd не отдаст серверу страницу подписок
 DEFAULT_USERS = [
@@ -101,6 +108,13 @@ class State:
         self.data["x"].setdefault("seen", [])
         self.data.setdefault("kanoner", {})
         self.data["kanoner"].setdefault("seen", [])
+        am = self.data.setdefault("america", {})
+        am.setdefault("tg", {})            # канал -> номер последнего прочитанного поста
+        am.setdefault("feeds_seen", [])    # записи RSS
+        am.setdefault("pages", {})         # страница афиши -> отпечаток текста
+        am.setdefault("timepad_seen", [])  # события Timepad
+        am.setdefault("posted", [])        # опубликованные анонсы: {"date", "title"}
+        am.setdefault("fails", {})         # источник -> сколько проверок подряд не читается
         self.data.setdefault("errors", {})
         self.data.setdefault("last", {})
         self.data.setdefault("bindings", {})  # источник -> [id каналов]
@@ -1032,6 +1046,211 @@ async def check_kanoner(bot):
         log.info("Канонер: %d постов", posted)
         return posted
 
+# ─── Американистика: анонсы лекций ──────────────────────────────────────────
+
+async def claude_text(prompt, model, max_tokens=4000):
+    import anthropic
+    client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+    resp = await client.messages.create(model=model, max_tokens=max_tokens,
+                                        messages=[{"role": "user", "content": prompt}])
+    return "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+
+
+async def america_tg(client, handle, last):
+    """Новые посты канала после last (на первой проверке - все, что видно). -> (посты, номер последнего)."""
+    r = await http_get(client, f"https://t.me/s/{handle}")
+    posts = america.parse_tg(r.text, handle)
+    if not posts:
+        raise RuntimeError("в веб-версии канала нет постов")
+    # с прошлой проверки вышло больше, чем помещается на страницу: читаем еще одну
+    if last and posts[0]["id"] > last + 1:
+        before = america.tg_before(r.text)
+        if before:
+            r2 = await http_get(client, f"https://t.me/s/{handle}?before={before}")
+            older = america.parse_tg(r2.text, handle)
+            posts = sorted({p["id"]: p for p in older + posts}.values(), key=lambda p: p["id"])
+    new = [p for p in posts if not last or p["id"] > last]
+    return new, posts[-1]["id"]
+
+
+class TimepadAuth(Exception):
+    pass
+
+
+async def america_timepad(client, seen):
+    """Будущие события Timepad в Петербурге по ключевым словам. -> [{'id','text','url'}]."""
+    headers = {**HEADERS, "Accept": "application/json"}
+    if TIMEPAD_TOKEN:
+        headers["Authorization"] = f"Bearer {TIMEPAD_TOKEN}"
+    today = datetime.now(america.MSK).strftime("%Y-%m-%d")
+    found = {}
+    for kw in america.TIMEPAD_KEYWORDS:
+        params = {"limit": 100, "cities": america.TIMEPAD_CITY, "keywords": kw,
+                  "starts_at_min": today, "fields": "location,description_short", "sort": "+starts_at"}
+        r = await client.get("https://api.timepad.ru/v1/events", params=params, headers=headers, timeout=30)
+        if r.status_code == 400:  # не понравился формат даты - даты все равно проверит Claude
+            params.pop("starts_at_min")
+            r = await client.get("https://api.timepad.ru/v1/events", params=params, headers=headers, timeout=30)
+        if r.status_code in (401, 403):
+            raise TimepadAuth(str(r.status_code))
+        r.raise_for_status()
+        for c in america.timepad_candidates(r.json()):
+            if c["id"] not in seen:
+                found[c["id"]] = c
+    return list(found.values())
+
+
+_america_lock = asyncio.Lock()
+
+async def check_america(bot):
+    async with _america_lock:
+        channels = state.channels("america")
+        if not channels:
+            return 0
+        st = state.data["america"]
+        if not ANTHROPIC_API_KEY:
+            await notify_owner(bot, "america", "Американистика: без ANTHROPIC_API_KEY не могу отбирать анонсы.")
+            state.data["last"]["america"] = time.time()
+            state.save()
+            return 0
+
+        candidates = []  # {'source', 'url', 'text', 'kind'}
+        commits = []     # что запомнить, когда Claude отберет анонсы
+        failed, ok = {}, set()
+
+        async with httpx.AsyncClient() as client:
+            for handle, venue in america.TG_CHANNELS.items():
+                name = f"t.me/{handle}"
+                try:
+                    new, last_id = await america_tg(client, handle, st["tg"].get(handle))
+                    commits.append(("tg", handle, last_id))
+                    candidates += [{"source": venue, "url": p["url"], "text": p["text"], "kind": "post"}
+                                   for p in new if america.relevant(p["text"])]
+                    ok.add(name)
+                except Exception as e:
+                    failed[name] = e
+
+            for feed in america.FEEDS:
+                try:
+                    r = await http_get(client, feed["url"])
+                    seen = set(st["feeds_seen"])
+                    for it in america.parse_feed(r.text):
+                        if it["id"] in seen:
+                            continue
+                        commits.append(("feed", it["id"]))
+                        if america.relevant(it["text"]):
+                            candidates.append({"source": feed["name"], "url": it["url"], "text": it["text"], "kind": "post"})
+                    ok.add(feed["url"])
+                except Exception as e:
+                    failed[feed["url"]] = e
+
+            for page in america.PAGES:
+                try:
+                    r = await http_get(client, page["url"])
+                    text = america.page_text(r.text, str(r.url))
+                    ok.add(page["url"])
+                    h = america.digest(text)
+                    if h == st["pages"].get(page["url"]):
+                        continue
+                    commits.append(("page", page["url"], h))
+                    if america.relevant(text):
+                        candidates.append({"source": page["name"], "url": page["url"], "text": text, "kind": "page"})
+                except Exception as e:
+                    failed[page["url"]] = e
+
+            if TIMEPAD_TOKEN or not st.get("timepad_needs_token"):
+                try:
+                    for c in await america_timepad(client, set(st["timepad_seen"])):
+                        commits.append(("timepad", c["id"]))
+                        candidates.append({"source": "Timepad", "url": c["url"], "text": c["text"], "kind": "post"})
+                    st.pop("timepad_needs_token", None)
+                    ok.add("Timepad")
+                except TimepadAuth as e:
+                    if not TIMEPAD_TOKEN:
+                        st["timepad_needs_token"] = True
+                        if OWNER_ID:
+                            try:
+                                await bot.send_message(OWNER_ID, f"Американистика: Timepad отказал в доступе (код {e}), "
+                                                       "скорее всего API нужен токен. Заведи токен разработчика на "
+                                                       "dev.timepad.ru и добавь его в Railway как TIMEPAD_TOKEN. "
+                                                       "До тех пор Timepad пропускаю, остальные источники читаю.")
+                            except TelegramError:
+                                pass
+                    else:
+                        failed["Timepad"] = "токен не принят"
+                except Exception as e:
+                    failed["Timepad"] = e
+
+        # Claude отбирает лекции и достает поля анонса
+        today = datetime.now(america.MSK).date()
+        found = []
+        try:
+            for batch in america.batches(candidates):
+                raw = await claude_text(america.build_prompt(batch, today), AMERICA_MODEL)
+                for ev in america.parse_answer(raw):
+                    try:
+                        src = batch[int(ev.get("src")) - 1]
+                    except (TypeError, ValueError, IndexError):
+                        continue
+                    if not america.valid_event(ev, today):
+                        continue
+                    ev["source"], ev["source_url"] = src["source"], src["url"]
+                    found.append(ev)
+        except Exception as e:
+            log.exception("Американистика: Claude не ответил")
+            await notify_owner(bot, "america", f"Американистика: не получилось отобрать анонсы ({type(e).__name__}). "
+                                               "Ничего не потеряно, попробую при следующей проверке.")
+            state.data["last"]["america"] = time.time()
+            state.save()
+            return 0
+
+        for c in commits:
+            if c[0] == "tg":
+                st["tg"][c[1]] = c[2]
+            elif c[0] == "feed":
+                st["feeds_seen"].append(c[1])
+            elif c[0] == "page":
+                st["pages"][c[1]] = c[2]
+            elif c[0] == "timepad":
+                st["timepad_seen"].append(c[1])
+        st["feeds_seen"] = st["feeds_seen"][-500:]
+        st["timepad_seen"] = st["timepad_seen"][-1000:]
+        state.save()
+
+        posted = 0
+        found.sort(key=lambda e: (str(e["date"]), str(e.get("time") or "")))
+        async with httpx.AsyncClient() as client:
+            for ev in found:
+                if any(america.same_event(ev, h) for h in st["posted"]):
+                    continue
+                try:
+                    await broadcast(bot, client, channels, lambda lim, e=ev: america.build_post(e), [])
+                except Exception:
+                    log.exception("Анонс не отправлен: %s", ev.get("title"))
+                    continue
+                st["posted"] = (st["posted"] + [{"date": str(ev["date"])[:10], "title": ev["title"]}])[-500:]
+                posted += 1
+                state.save()
+                await asyncio.sleep(3)
+
+        # источники, которые не читаются три проверки подряд
+        fails = st["fails"]
+        for name in ok:
+            fails.pop(name, None)
+        for name in failed:
+            fails[name] = fails.get(name, 0) + 1
+            log.warning("Американистика: %s не прочитан: %s", name, failed[name])
+        broken = [f"• {n} ({failed[n]})" for n in failed if fails[n] >= 3]
+        if broken:
+            await notify_owner(bot, "america-sources", "Американистика: эти источники не читаются уже несколько проверок "
+                                                       "подряд:\n" + "\n".join(broken))
+
+        state.data["last"]["america"] = time.time()
+        state.save()
+        log.info("Американистика: материалов на проверку %d, анонсов найдено %d, отправлено %d",
+                 len(candidates), len(found), posted)
+        return posted
+
 # ─── Источники ──────────────────────────────────────────────────────────────
 # Новый источник = функция check_<имя>(bot) + строка здесь.
 
@@ -1039,6 +1258,8 @@ SOURCES = {
     "letterboxd": {"title": "Letterboxd: просмотры твоих подписок", "check": check_letterboxd, "every": LB_INTERVAL},
     "svetov":     {"title": "Светов в X: «рекомендую» / «не рекомендую»", "check": check_x, "every": X_INTERVAL},
     "kanoner":    {"title": "Канонер: стройка и город, Петербург", "check": check_kanoner, "every": KANONER_INTERVAL},
+    "america":    {"title": "Американистика: очные лекции о США и Канаде в Петербурге", "check": check_america,
+                   "every": AMERICA_INTERVAL},
 }
 
 
