@@ -507,7 +507,7 @@ async def send_post(bot, client, chat_id, text_builder, images, preview_url=None
     if preview_url and not images:
         return await tg_call(bot.send_message, chat_id, text=text_builder(MESSAGE_LIMIT), parse_mode=ParseMode.HTML,
                              link_preview_options=LinkPreviewOptions(url=preview_url, prefer_large_media=True,
-                                                                     show_above_text=True))
+                                                                     show_above_text=False))
     images = [u for u in images if u][:ALBUM_LIMIT]
 
     if len(images) <= 1:
@@ -1337,7 +1337,7 @@ async def lecture_draft(bot, client, st):
         fid = lectures.fragment_id(cid, n, seg)
         total = len(st["lists"][cid])
         raw = await claude_json(lectures.write_prompt(course, n, total, lec, seg), LECTURES_MODEL,
-                                lectures.WRITE_SCHEMA, max_tokens=6000)
+                                lectures.WRITE_SCHEMA, max_tokens=8000)
         post = lectures.parse_answer(raw)
         if post is None:
             log.warning("Конспект %s: ответ без заголовка или текста: %r", fid, raw)
@@ -1349,13 +1349,12 @@ async def lecture_draft(bot, client, st):
             state.save()
             continue
         quote_ru = None
-        passage = lectures.extract_quote(lectures.segment_text(lec, seg), post.get("quote_start"),
-                                         post.get("quote_end"))
-        if passage:
-            quote_ru = (await claude_text(lectures.translate_prompt(course, passage), LECTURES_MODEL,
-                                          max_tokens=4000)).strip() or None
+        passages = lectures.extract_quotes(lectures.segment_text(lec, seg), post.get("quote"))
+        if passages:
+            quote_ru = (await claude_text(lectures.translate_prompt(course, passages), LECTURES_MODEL,
+                                          max_tokens=5000)).strip() or None
         else:
-            log.info("Конспект %s: якоря цитаты не нашлись в расшифровке", fid)
+            log.info("Конспект %s: куски цитаты не нашлись в расшифровке: %r", fid, post.get("quote"))
         return {"fragment": fid, "course": cid, "title": post["title"], "tags": lectures.post_tags(post, course),
                 "text": lectures.build_post(post, course, n, total, lec, seg, quote_ru),
                 "preview": lectures.video_url(lec, seg)}
