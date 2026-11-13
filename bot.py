@@ -7,6 +7,7 @@
   svetov      посты @msvetov в X с «рекомендую» / «не рекомендую»
   kanoner     новости kanoner.com (строительство и город, Петербург)
   america     анонсы очных лекций о США и Канаде в Петербурге (см. america.py)
+  lectures    конспекты лекций Йеля, раз в день (см. lectures.py)
 
 Переменные окружения (Railway -> Variables):
   TELEGRAM_TOKEN      токен бота от BotFather (обязательно)
@@ -24,7 +25,7 @@ import html
 import time
 import asyncio
 import logging
-import xml.etree.ElementTree as ET
+from datetime import datetime, timezone, timedelta
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from urllib.parse import urljoin
@@ -33,6 +34,7 @@ import httpx
 from bs4 import BeautifulSoup
 
 import america
+import lectures
 from telegram import Update, InputMediaPhoto, LinkPreviewOptions
 from telegram.constants import ParseMode
 from telegram.error import RetryAfter, TelegramError
@@ -64,6 +66,9 @@ CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-5-5")
 AMERICA_INTERVAL = float(os.environ.get("AMERICA_INTERVAL_HOURS", "12")) * 3600
 AMERICA_MODEL = os.environ.get("AMERICA_MODEL", CLAUDE_MODEL)
 TIMEPAD_TOKEN = os.environ.get("TIMEPAD_TOKEN", "").strip()
+LECTURES_MODEL = os.environ.get("LECTURES_MODEL", "claude-sonnet-5-5")
+LECTURES_HOUR = int(os.environ.get("LECTURES_HOUR", "10"))            # час публикации конспекта
+LECTURES_UTC_OFFSET = float(os.environ.get("LECTURES_UTC_OFFSET", "5"))  # Алматы
 
 # На случай, если Letterboxd не отдаст серверу страницу подписок
 DEFAULT_USERS = [
@@ -115,6 +120,11 @@ class State:
         am.setdefault("timepad_seen", [])  # события Timepad
         am.setdefault("posted", [])        # опубликованные анонсы: {"date", "title"}
         am.setdefault("fails", {})         # источник -> сколько проверок подряд не читается
+        lc = self.data.setdefault("lectures", {})
+        lc.setdefault("lists", {})         # курс -> номера лекций
+        lc.setdefault("used", [])          # использованные главы: "hist-119/5/3"
+        lc.setdefault("exhausted", [])     # лекции, где свободных глав не осталось
+        lc.setdefault("posted", [])        # журнал: глава, заголовок, теги, дата
         self.data.setdefault("errors", {})
         self.data.setdefault("last", {})
         self.data.setdefault("bindings", {})  # источник -> [id каналов]
@@ -1260,6 +1270,74 @@ async def check_america(bot):
                  len(candidates), len(found), posted)
         return posted
 
+# ─── Американистика: конспекты лекций Йеля ──────────────────────────────────
+
+_lectures_lock = asyncio.Lock()
+
+async def check_lectures(bot, force=False):
+    """Раз в день, после LECTURES_HOUR, один конспект главы лекции. force - для /check."""
+    async with _lectures_lock:
+        channels = state.channels("lectures")
+        if not channels:
+            return 0
+        st = state.data["lectures"]
+        now = datetime.now(timezone(timedelta(hours=LECTURES_UTC_OFFSET)))
+        today = now.date().isoformat()
+        state.data["last"]["lectures"] = time.time()
+        if not force and (now.hour < LECTURES_HOUR or st.get("last_day") == today):
+            state.save()
+            return 0
+        if not ANTHROPIC_API_KEY:
+            await notify_owner(bot, "lectures", "Конспекты: без ANTHROPIC_API_KEY не могу писать посты.")
+            state.save()
+            return 0
+        try:
+            async with httpx.AsyncClient() as client:
+                for cid, course in lectures.COURSES.items():
+                    if not st["lists"].get(cid):
+                        r = await http_get(client, course["url"])
+                        st["lists"][cid] = lectures.lecture_numbers(r.text, cid)
+                for _ in range(5):
+                    choice = lectures.pick(list(lectures.COURSES), st["lists"], set(st["exhausted"]),
+                                           st.get("last_course"))
+                    if not choice:
+                        await notify_owner(bot, "lectures", "Конспекты: все главы всех курсов уже использованы. "
+                                                            "Пора добавить новые курсы.")
+                        state.save()
+                        return 0
+                    cid, n = choice
+                    course = lectures.COURSES[cid]
+                    r = await http_get(client, f"{course['url']}/lecture-{n}")
+                    lec = lectures.parse_lecture(r.text)
+                    ch = lectures.choose_chapter(cid, n, lec, set(st["used"]))
+                    if not ch:
+                        st["exhausted"].append(f"{cid}/{n}")
+                        continue
+                    fid = lectures.fragment_id(cid, n, ch["n"])
+                    raw = await claude_text(lectures.build_prompt(course, n, lec, ch), LECTURES_MODEL,
+                                            max_tokens=3000)
+                    post = lectures.parse_answer(raw)
+                    if post is None:
+                        raise RuntimeError("Claude ответил не в том формате")
+                    st["used"].append(fid)
+                    if post.get("skip"):  # организационная глава
+                        state.save()
+                        continue
+                    text = lectures.build_post(post, course, n, lec, ch)
+                    await broadcast(bot, client, channels, lambda lim: text, [])
+                    st["posted"] = (st["posted"] + [{"fragment": fid, "title": post["title"], "date": today,
+                                                     "tags": lectures.post_tags(post, course)}])[-1000:]
+                    st["last_day"], st["last_course"] = today, cid
+                    state.save()
+                    log.info("Конспект %s: %s", fid, post["title"])
+                    return 1
+        except Exception as e:
+            log.exception("Конспекты: ошибка")
+            await notify_owner(bot, "lectures", f"Конспекты: не получилось подготовить пост ({type(e).__name__}: {e}). "
+                                                "Попробую позже.")
+        state.save()
+        return 0
+
 # ─── Источники ──────────────────────────────────────────────────────────────
 # Новый источник = функция check_<имя>(bot) + строка здесь.
 
@@ -1269,6 +1347,8 @@ SOURCES = {
     "kanoner":    {"title": "Канонер: стройка и город, Петербург", "check": check_kanoner, "every": KANONER_INTERVAL},
     "america":    {"title": "Американистика: очные лекции о США и Канаде в Петербурге", "check": check_america,
                    "every": AMERICA_INTERVAL},
+    "lectures":   {"title": "Американистика: конспекты лекций Йеля, раз в день", "check": check_lectures,
+                   "every": 1800},
 }
 
 
@@ -1410,7 +1490,8 @@ async def cmd_check(update, context):
             continue
         await update.message.reply_text(f"Проверяю {name}...")
         try:
-            n = await SOURCES[name]["check"](context.bot)
+            fn = SOURCES[name]["check"]
+            n = await (fn(context.bot, force=True) if name == "lectures" else fn(context.bot))
             lines.append(f"{name}: новых постов {n}")
         except Exception as e:
             log.exception("Ручная проверка %s", name)
