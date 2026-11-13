@@ -1075,18 +1075,24 @@ async def claude_text(prompt, model, max_tokens=4000):
 
 
 async def claude_json(prompt, model, schema, max_tokens=4000):
-    """Ответ строго по схеме через инструмент: JSON всегда валидный, кавычки в тексте ничего не ломают."""
+    """Ответ по схеме через инструмент answer: кавычки в тексте не ломают JSON.
+
+    Принудительный вызов (tool_choice "tool") новые модели не принимают, поэтому "auto"
+    и просьба в промпте; если модель все же ответила текстом - разбираем JSON из текста.
+    """
     import anthropic
     client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
     resp = await client.messages.create(
-        model=model, max_tokens=max_tokens, messages=[{"role": "user", "content": prompt}],
+        model=model, max_tokens=max_tokens,
+        messages=[{"role": "user", "content": prompt + "\n\nОтветь одним вызовом инструмента answer."}],
         tools=[{"name": "answer", "description": "Ответ на задание", "input_schema": schema}],
-        tool_choice={"type": "tool", "name": "answer"})
+        tool_choice={"type": "auto"})
     for b in resp.content:
         if getattr(b, "type", "") == "tool_use":
             return b.input
-    log.warning("Claude не вызвал инструмент, stop_reason=%s", resp.stop_reason)
-    return None
+    text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+    log.warning("Claude ответил текстом, а не инструментом (stop_reason=%s): %.500s", resp.stop_reason, text)
+    return text
 
 
 async def america_tg(client, handle, last):
@@ -1335,7 +1341,8 @@ async def lecture_draft(bot, client, st):
         post = lectures.parse_answer(raw)
         if post is None:
             log.warning("Конспект %s: ответ без заголовка или текста: %r", fid, raw)
-            raise RuntimeError(f"в ответе Claude нет заголовка или текста (ключи: {sorted(raw or {})})")
+            keys = sorted(raw) if isinstance(raw, dict) else f"текст: {str(raw)[:150]}"
+            raise RuntimeError(f"в ответе Claude нет заголовка или текста ({keys})")
         if post.get("skip"):  # сюжет оказался организационным
             st["used"].append(fid)
             used.add(fid)
