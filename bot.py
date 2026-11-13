@@ -505,9 +505,11 @@ async def send_post(bot, client, chat_id, text_builder, images, preview_url=None
     preview_url - пост без картинки, но с превью этой ссылки над текстом (видео YouTube).
     """
     if preview_url and not images:
-        return await tg_call(bot.send_message, chat_id, text=text_builder(MESSAGE_LIMIT), parse_mode=ParseMode.HTML,
-                             link_preview_options=LinkPreviewOptions(url=preview_url, prefer_large_media=True,
-                                                                     show_above_text=False))
+        msg = await tg_call(bot.send_message, chat_id, text=text_builder(MESSAGE_LIMIT), parse_mode=ParseMode.HTML,
+                            link_preview_options=LinkPreviewOptions(url=preview_url, prefer_large_media=True,
+                                                                    show_above_text=False))
+        log.info("Превью %s: Telegram вернул %s", preview_url, getattr(msg, "link_preview_options", None))
+        return msg
     images = [u for u in images if u][:ALBUM_LIMIT]
 
     if len(images) <= 1:
@@ -1336,25 +1338,28 @@ async def lecture_draft(bot, client, st):
             continue
         fid = lectures.fragment_id(cid, n, seg)
         total = len(st["lists"][cid])
-        raw = await claude_json(lectures.write_prompt(course, n, total, lec, seg), LECTURES_MODEL,
-                                lectures.WRITE_SCHEMA, max_tokens=8000)
-        post = lectures.parse_answer(raw)
-        if post is None:
-            log.warning("Конспект %s: ответ без заголовка или текста: %r", fid, raw)
-            keys = sorted(raw) if isinstance(raw, dict) else f"текст: {str(raw)[:150]}"
-            raise RuntimeError(f"в ответе Claude нет заголовка или текста ({keys})")
-        if post.get("skip"):  # сюжет оказался организационным
+        notes = lectures.parse_answer(await claude_json(
+            lectures.notes_prompt(course, n, total, lec, seg), LECTURES_MODEL, lectures.NOTES_SCHEMA,
+            max_tokens=6000))
+        if notes is None:
+            raise RuntimeError("Claude не подготовил заметки к фрагменту")
+        if notes.get("skip"):  # сюжет оказался организационным
             st["used"].append(fid)
             used.add(fid)
             state.save()
             continue
+        post = lectures.parse_post(await claude_text(lectures.post_prompt(course, n, lec, seg, notes),
+                                                     LECTURES_MODEL, max_tokens=5000))
+        if post is None:
+            raise RuntimeError("Claude не написал пост по заметкам")
+        post["tags"] = notes.get("tags")
         quote_ru = None
-        passages = lectures.extract_quotes(lectures.segment_text(lec, seg), post.get("quote"))
+        passages = lectures.extract_quotes(lectures.segment_text(lec, seg), notes.get("quote"))
         if passages:
             quote_ru = (await claude_text(lectures.translate_prompt(course, passages), LECTURES_MODEL,
                                           max_tokens=5000)).strip() or None
         else:
-            log.info("Конспект %s: куски цитаты не нашлись в расшифровке: %r", fid, post.get("quote"))
+            log.info("Конспект %s: куски цитаты не нашлись в расшифровке: %r", fid, notes.get("quote"))
         return {"fragment": fid, "course": cid, "title": post["title"], "tags": lectures.post_tags(post, course),
                 "text": lectures.build_post(post, course, n, total, lec, seg, quote_ru),
                 "preview": lectures.video_url(lec, seg)}
