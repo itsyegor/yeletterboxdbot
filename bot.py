@@ -5,7 +5,7 @@
 Источники:
   letterboxd  просмотры людей, на которых ты подписан на Letterboxd
   svetov      посты @msvetov в X с «рекомендую» / «не рекомендую»
-  kanoner     новости kanoner.com (строительство и город, Петербург)
+  kanoner     посты Канонера во ВКонтакте (vk.com/kanoner), без ключа ВК - новости kanoner.com
   america     анонсы очных лекций о США и Канаде в Петербурге (см. america.py)
   lectures    конспекты лекций Йеля, раз в день (см. lectures.py)
 
@@ -15,6 +15,7 @@
   TMDB_KEY            ключ TMDB - названия фильмов на двух языках
   ANTHROPIC_API_KEY   ключ Claude API - найти фильм в посте Светова, отобрать лекции
   X_AUTH_TOKEN, X_CT0 cookie из браузера, где ты залогинен в X
+  VK_SERVICE_TOKEN    сервисный ключ приложения VK ID - читать стену Канонера в ВК
   TIMEPAD_TOKEN       токен Timepad, если API без него не пускает (необязательно)
   STATE_DIR           папка для памяти бота (по умолчанию /data - туда подключается volume)
 """
@@ -62,6 +63,9 @@ LB_INTERVAL = float(os.environ.get("LB_INTERVAL_HOURS", "6")) * 3600
 X_INTERVAL = float(os.environ.get("X_INTERVAL_HOURS", "24")) * 3600
 KANONER_INTERVAL = float(os.environ.get("KANONER_INTERVAL_HOURS", "3")) * 3600
 KANONER_FEED = os.environ.get("KANONER_FEED", "https://kanoner.com/feed/")
+VK_SERVICE_TOKEN = os.environ.get("VK_SERVICE_TOKEN", "").strip()
+KANONER_VK_ID = int(os.environ.get("KANONER_VK_ID", "-26680240"))   # vk.com/kanoner
+VK_API_VERSION = "5.199"
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-5-5")
 AMERICA_INTERVAL = float(os.environ.get("AMERICA_INTERVAL_HOURS", "12")) * 3600
 AMERICA_MODEL = os.environ.get("AMERICA_MODEL", CLAUDE_MODEL)
@@ -113,6 +117,7 @@ class State:
         self.data["x"].setdefault("seen", [])
         self.data.setdefault("kanoner", {})
         self.data["kanoner"].setdefault("seen", [])
+        self.data["kanoner"].setdefault("vk_seen", [])   # номера постов ВК
         am = self.data.setdefault("america", {})
         am.setdefault("tg", {})            # канал -> номер последнего прочитанного поста
         am.setdefault("feeds_seen", [])    # записи RSS
@@ -1019,6 +1024,168 @@ def build_kanoner(e, limit):
     return "\n".join(lines)
 
 
+
+# ─── Канонер во ВКонтакте ───────────────────────────────────────────────────
+# Стена сообщества через API ВК (wall.get) с сервисным ключом приложения VK ID.
+# В ВК у Канонера больше заметок, чем на сайте, и у каждой есть фото.
+
+VK_MAX_AGE = 3 * 86400   # старые посты (например, новый закреп) не присылаем
+
+class VKError(Exception):
+    pass
+
+
+async def vk_wall(client, owner_id, count=30):
+    # POST: ключ уходит в теле запроса и не попадает в логи вместе с адресом
+    r = await client.post("https://api.vk.com/method/wall.get",
+                          data={"owner_id": owner_id, "count": count, "extended": 0,
+                                "access_token": VK_SERVICE_TOKEN, "v": VK_API_VERSION},
+                          headers=HEADERS, timeout=30)
+    r.raise_for_status()
+    data = r.json()
+    if "error" in data:
+        err = data["error"]
+        raise VKError(f"{err.get('error_code')}: {err.get('error_msg')}")
+    return data["response"]["items"]
+
+
+def _vk_photo_url(photo):
+    """Самый большой размер фото."""
+    orig = (photo.get("orig_photo") or {}).get("url")
+    if orig:
+        return orig
+    sizes = photo.get("sizes") or []
+    if not sizes:
+        return None
+    best = max(sizes, key=lambda z: (z.get("width") or 0) * (z.get("height") or 0))
+    return best.get("url")
+
+
+def _vk_video_preview(video):
+    imgs = video.get("image") or []
+    if not imgs:
+        return None
+    return max(imgs, key=lambda z: (z.get("width") or 0) * (z.get("height") or 0)).get("url")
+
+
+VK_MENTION = re.compile(r"\[((?:club|public|id|event)\d+|[\w.]+)\|([^\]]+)\]")
+URL_RE = re.compile(r"(?:https?://)?(?:www\.)?[\w.-]+\.(?:com|ru|рф|org|net|me|su)(?:/[^\s<]*)?", re.I)
+
+
+def vk_text_html(text):
+    """Текст поста ВК -> HTML Telegram: упоминания [club1|Имя] и голые ссылки становятся ссылками."""
+    out, pos = [], 0
+    for m in VK_MENTION.finditer(text):
+        out.append(("t", text[pos:m.start()]))
+        out.append(("a", m.group(2), f"https://vk.com/{m.group(1)}"))
+        pos = m.end()
+    out.append(("t", text[pos:]))
+    res = []
+    for part in out:
+        if part[0] == "a":
+            res.append(f'<a href="{esc(part[2])}">{esc(part[1])}</a>')
+            continue
+        chunk, p = part[1], 0
+        for m in URL_RE.finditer(chunk):
+            url = m.group(0).rstrip(".,;:!?)»\"")
+            res.append(esc(chunk[p:m.start()]))
+            href = url if url.lower().startswith("http") else "https://" + url
+            res.append(f'<a href="{esc(href)}">{esc(url)}</a>')
+            p = m.start() + len(url)
+        res.append(esc(chunk[p:]))
+    return "".join(res)
+
+
+def parse_vk_post(item):
+    """Пост стены -> {'id', 'text', 'images', 'link', 'date'}; None для рекламы."""
+    if item.get("marked_as_ads"):
+        return None
+    src = item
+    text = (item.get("text") or "").strip()
+    reposted = None
+    if item.get("copy_history"):
+        src = item["copy_history"][0]
+        reposted = src
+        inner = (src.get("text") or "").strip()
+        text = (text + "\n\n" + inner).strip() if text else inner
+    images, extra = [], []
+    for a in src.get("attachments") or []:
+        t = a.get("type")
+        if t == "photo":
+            images.append(_vk_photo_url(a["photo"]))
+        elif t == "video":
+            extra.append(_vk_video_preview(a["video"]))
+        elif t == "link":
+            ph = (a["link"].get("photo") or {})
+            extra.append(_vk_photo_url(ph) if ph else None)
+            url = a["link"].get("url") or ""
+            if url and url.split("//")[-1].split("?")[0].rstrip("/") not in text:
+                text = (text + "\n" + url).strip()
+    images = [u for u in images if u] or [u for u in extra if u][:1]
+    pid = f"{item['owner_id']}_{item['id']}"
+    return {
+        "id": pid,
+        "text": text,
+        "images": images[:ALBUM_LIMIT],
+        "link": f"https://vk.com/wall{pid}",
+        "date": item.get("date") or 0,
+        "pinned": bool(item.get("is_pinned")),
+        "repost_of": f"{reposted['owner_id']}_{reposted['id']}" if reposted else None,
+    }
+
+
+def build_vk_post(p, limit):
+    body = cut(p["text"], min(limit, 900)) if limit else ""
+    lines = [vk_text_html(body)] if body else []
+    lines.append(f'<a href="{esc(p["link"])}">Пост Канонера в ВК</a>')
+    return "\n\n".join(lines)
+
+
+async def check_kanoner_vk(bot, channels):
+    ks = state.data["kanoner"]
+    posted = 0
+    async with httpx.AsyncClient() as client:
+        try:
+            posts = [p for p in (parse_vk_post(i) for i in await vk_wall(client, KANONER_VK_ID)) if p]
+        except Exception as e:
+            log.exception("ВК Канонера недоступен")
+            await notify_owner(bot, "kanoner", f"Лента: не получилось прочитать Канонер в ВК ({type(e).__name__}: {e}).")
+            state.data["last"]["kanoner"] = time.time()
+            state.save()
+            return 0
+        posts.sort(key=lambda p: p["date"])
+
+        if not ks.get("vk_initialized"):
+            ks["vk_seen"] = [p["id"] for p in posts][-SEEN_KEEP:]
+            ks["vk_initialized"] = True
+            state.data["last"]["kanoner"] = time.time()
+            state.save()
+            log.info("Канонер ВК: первый запуск, отмечено %d постов", len(posts))
+            return 0
+
+        seen = set(ks["vk_seen"])
+        now = time.time()
+        for p in posts:
+            if p["id"] in seen:
+                continue
+            if now - p["date"] > VK_MAX_AGE or not (p["text"] or p["images"]):
+                ks["vk_seen"] = (ks["vk_seen"] + [p["id"]])[-SEEN_KEEP:]
+                continue
+            try:
+                await broadcast(bot, client, channels, lambda lim, p=p: build_vk_post(p, lim), p["images"])
+                posted += 1
+            except Exception:
+                log.exception("Пост Канонера из ВК не отправлен")
+                break
+            ks["vk_seen"] = (ks["vk_seen"] + [p["id"]])[-SEEN_KEEP:]
+            state.save()
+            await asyncio.sleep(3)
+
+    state.data["last"]["kanoner"] = time.time()
+    state.save()
+    log.info("Канонер ВК: %d постов", posted)
+    return posted
+
 _kanoner_lock = asyncio.Lock()
 
 async def check_kanoner(bot):
@@ -1026,6 +1193,8 @@ async def check_kanoner(bot):
         channels = state.channels("kanoner")
         if not channels:
             return 0
+        if VK_SERVICE_TOKEN:
+            return await check_kanoner_vk(bot, channels)
         ks = state.data["kanoner"]
         posted = 0
         async with httpx.AsyncClient() as client:
@@ -1453,7 +1622,7 @@ async def check_lectures(bot, force=False, preview=False):
 SOURCES = {
     "letterboxd": {"title": "Letterboxd: просмотры твоих подписок", "check": check_letterboxd, "every": LB_INTERVAL},
     "svetov":     {"title": "Светов в X: «рекомендую» / «не рекомендую»", "check": check_x, "every": X_INTERVAL},
-    "kanoner":    {"title": "Канонер: стройка и город, Петербург", "check": check_kanoner, "every": KANONER_INTERVAL},
+    "kanoner":    {"title": "Канонер: стройка и город, Петербург (посты из ВК)", "check": check_kanoner, "every": KANONER_INTERVAL},
     "america":    {"title": "Американистика: очные лекции о США и Канаде в Петербурге", "check": check_america,
                    "every": AMERICA_INTERVAL},
     "lectures":   {"title": "Американистика: конспекты лекций Йеля, раз в день", "check": check_lectures,
