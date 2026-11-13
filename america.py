@@ -362,6 +362,13 @@ def _esc(s):
     return htmlmod.escape(str(s or ""), quote=False)
 
 
+def _address(addr):
+    """Адрес без почтового индекса и без «Санкт-Петербург»: все анонсы и так петербургские."""
+    s = re.sub(r"\b\d{6}\b,?\s*", "", str(addr or ""))
+    s = re.sub(r"(г\.\s*)?(Санкт-Петербург|СПб|Петербург)\b,?\s*", "", s, flags=re.I)
+    return s.strip(" ,;") or None
+
+
 def _href(url):
     return htmlmod.escape(str(url), quote=True)
 
@@ -412,7 +419,7 @@ def build_post(ev):
         if s.get("about"):
             line += f", <i>{_esc(_cut(strip_urls(s['about']), 200))}</i>"
         facts.append(line)
-    place = ", ".join(strip_urls(str(x)) for x in [ev.get("venue"), ev.get("address")] if x)
+    place = ", ".join(strip_urls(str(x)) for x in [ev.get("venue"), _address(ev.get("address"))] if x)
     if place:
         facts.append("📍 " + _esc(_cut(place, 300)))
     if ev.get("price"):

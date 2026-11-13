@@ -7,7 +7,7 @@
   svetov      посты @msvetov в X с «рекомендую» / «не рекомендую»
   kanoner     посты Канонера во ВКонтакте (vk.com/kanoner), без ключа ВК - новости kanoner.com
   america     анонсы очных лекций о США и Канаде в Петербурге (см. america.py)
-  lectures    конспекты лекций Йеля, раз в день (см. lectures.py)
+  lectures    посты по лекциям Йеля, раз в день (см. lectures.py)
 
 Переменные окружения (Railway -> Variables):
   TELEGRAM_TOKEN      токен бота от BotFather (обязательно)
@@ -527,7 +527,7 @@ async def send_post(bot, client, chat_id, text_builder, images, preview_url=None
     if preview_url and not images:
         msg = await tg_call(bot.send_message, chat_id, text=text_builder(MESSAGE_LIMIT), parse_mode=ParseMode.HTML,
                             link_preview_options=LinkPreviewOptions(url=preview_url, prefer_large_media=True,
-                                                                    show_above_text=False))
+                                                                    show_above_text=True))
         log.info("Превью %s: Telegram вернул %s", preview_url, getattr(msg, "link_preview_options", None))
         return msg
     images = [u for u in images if u][:ALBUM_LIMIT]
@@ -1625,7 +1625,7 @@ SOURCES = {
     "kanoner":    {"title": "Канонер: стройка и город, Петербург (посты из ВК)", "check": check_kanoner, "every": KANONER_INTERVAL},
     "america":    {"title": "Американистика: очные лекции о США и Канаде в Петербурге", "check": check_america,
                    "every": AMERICA_INTERVAL},
-    "lectures":   {"title": "Американистика: конспекты лекций Йеля, раз в день", "check": check_lectures,
+    "lectures":   {"title": "Американистика: рассказы по лекциям Йеля, раз в день", "check": check_lectures,
                    "every": 1800},
 }
 
@@ -1696,7 +1696,7 @@ async def cmd_start(update, context):
         "Команды здесь:\n"
         "/list - источники, каналы и чьи ленты Letterboxd читаю\n"
         "/check - проверить все источники сейчас (или /check kanoner)\n"
-        "/check lectures - черновик конспекта мне в личку, /publish - выпустить его в канал\n"
+        "/check lectures - черновик поста по лекции мне в личку, /publish - выпустить его в канал\n"
         "/add ник, /remove ник - люди на Letterboxd"
     )
 

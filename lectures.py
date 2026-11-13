@@ -1,5 +1,5 @@
 """
-Американистика: конспекты лекций Open Yale Courses (лицензия CC BY-NC-SA).
+Американистика: посты по лекциям Open Yale Courses (лицензия CC BY-NC-SA).
 
 Единица поста - сюжет: законченный кусок лекции на 10-20 минут (несколько глав подряд;
 в расшифровках Йеля лекция разбита на главы с таймкодом). Claude один раз читает лекцию
@@ -440,7 +440,7 @@ def translate_prompt(course, passages):
 
 
 def post_tags(post, course):
-    return ["конспект", course["tag"]] + america.clean_tags(post.get("tags"))
+    return ["лекции", course["tag"]] + america.clean_tags(post.get("tags"))
 
 
 def _esc(s):
@@ -483,7 +483,7 @@ def _trim_quote(q, n):
 
 def build_post(post, course, lecture_no, lectures_total, lecture, segment, quote_ru=None, limit=4000):
     """
-    🎓 КОНСПЕКТ ЛЕКЦИИ
+    🎓 ИЗ ЛЕКЦИИ
     ▶️ Видео с 12:34 (~15 мин) · 📄 Расшифровка (англ.)
 
     Заголовок
@@ -491,8 +491,8 @@ def build_post(post, course, lecture_no, lectures_total, lecture, segment, quote
 
     Рассказ... [свернутая цитата лектора] ...рассказ
 
-    #конспект #Блайт #теги
-    (превью видео под постом)
+    #лекции #Блайт #теги
+    (превью видео над постом)
     post - результат parse_post, теги - из заметок (post['tags']).
     """
     links = []
@@ -501,7 +501,7 @@ def build_post(post, course, lecture_no, lectures_total, lecture, segment, quote
         links.append(f'▶️ <a href="{_esc(url)}">Видео с {_clock(segment_start(lecture, segment))}</a> '
                      f'(~{segment_minutes(lecture, segment)} мин)')
     links.append(f'📄 <a href="{course["url"]}/lecture-{lecture_no}">Расшифровка (англ.)</a>')
-    head = ["🎓 <b>КОНСПЕКТ ЛЕКЦИИ</b>", " · ".join(links), "",
+    head = ["🎓 <b>ИЗ ЛЕКЦИИ</b>", " · ".join(links), "",
             f"<b>{_esc(america._cut(_clean(post['title']), 200))}</b>",
             f"<i>{_esc(course['author_full'])} · {_esc(course['title'])} · Йель, {course['year']} · "
             f"лекция {lecture_no} из {lectures_total}</i>", ""]
