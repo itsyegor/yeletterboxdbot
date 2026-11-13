@@ -122,8 +122,9 @@ class State:
         am.setdefault("fails", {})         # источник -> сколько проверок подряд не читается
         lc = self.data.setdefault("lectures", {})
         lc.setdefault("lists", {})         # курс -> номера лекций
-        lc.setdefault("used", [])          # использованные главы: "hist-119/5/3"
-        lc.setdefault("exhausted", [])     # лекции, где свободных глав не осталось
+        lc.setdefault("used", [])          # использованные сюжеты: "hist-119/5/s2" (раньше главы: "hist-119/5/3")
+        lc.setdefault("segments", {})      # "hist-119/5" -> разбивка лекции на сюжеты
+        lc.setdefault("exhausted", [])     # лекции, где свободных сюжетов не осталось
         lc.setdefault("posted", [])        # журнал: глава, заголовок, теги, дата
         self.data.setdefault("errors", {})
         self.data.setdefault("last", {})
@@ -498,8 +499,15 @@ async def download(client, url):
     return r.content
 
 
-async def send_post(bot, client, chat_id, text_builder, images):
-    """Пост с одной картинкой или альбомом. text_builder(limit) -> текст."""
+async def send_post(bot, client, chat_id, text_builder, images, preview_url=None):
+    """Пост с одной картинкой или альбомом. text_builder(limit) -> текст.
+
+    preview_url - пост без картинки, но с превью этой ссылки над текстом (видео YouTube).
+    """
+    if preview_url and not images:
+        return await tg_call(bot.send_message, chat_id, text=text_builder(MESSAGE_LIMIT), parse_mode=ParseMode.HTML,
+                             link_preview_options=LinkPreviewOptions(url=preview_url, prefer_large_media=True,
+                                                                     show_above_text=True))
     images = [u for u in images if u][:ALBUM_LIMIT]
 
     if len(images) <= 1:
@@ -548,12 +556,12 @@ async def send_post(bot, client, chat_id, text_builder, images):
                       link_preview_options=LinkPreviewOptions(is_disabled=True))
 
 
-async def broadcast(bot, client, channels, text_builder, images):
+async def broadcast(bot, client, channels, text_builder, images, preview_url=None):
     """Один пост во все каналы источника. Ошибка в одном канале не мешает остальным."""
     sent = 0
     for chat_id in channels:
         try:
-            await send_post(bot, client, chat_id, text_builder, images)
+            await send_post(bot, client, chat_id, text_builder, images, preview_url)
             sent += 1
         except Exception:
             log.exception("Пост не ушел в канал %s", chat_id)
@@ -1274,16 +1282,87 @@ async def check_america(bot):
 
 _lectures_lock = asyncio.Lock()
 
-async def check_lectures(bot, force=False):
-    """Раз в день, после LECTURES_HOUR, один конспект главы лекции. force - для /check."""
+async def lecture_draft(bot, client, st):
+    """Готовит пост по следующему свободному сюжету. -> черновик (dict) или None, если все использовано."""
+    for cid, course in lectures.COURSES.items():
+        if not st["lists"].get(cid):
+            r = await http_get(client, course["url"])
+            st["lists"][cid] = lectures.lecture_numbers(r.text, cid)
+    used = set(st["used"])
+    if st.get("draft"):  # просили другой черновик - не повторяем прежний
+        used.add(st["draft"]["fragment"])
+    for _ in range(6):
+        choice = lectures.pick(list(lectures.COURSES), st["lists"], set(st["exhausted"]), st.get("last_course"))
+        if not choice:
+            return None
+        cid, n = choice
+        course = lectures.COURSES[cid]
+        r = await http_get(client, f"{course['url']}/lecture-{n}")
+        lec = lectures.parse_lecture(r.text)
+        key = f"{cid}/{n}"
+        segs = st["segments"].get(key)
+        if segs is None:
+            raw = await claude_text(lectures.segment_prompt(course, n, lec), LECTURES_MODEL, max_tokens=2000)
+            segs = lectures.parse_segments(raw, lec)
+            if segs is None:
+                raise RuntimeError("Claude не разбил лекцию на сюжеты")
+            st["segments"][key] = segs
+            state.save()
+        seg = lectures.choose_segment(cid, n, segs, used)
+        if not seg:
+            st["exhausted"].append(key)
+            continue
+        fid = lectures.fragment_id(cid, n, seg)
+        total = len(st["lists"][cid])
+        post = lectures.parse_answer(await claude_text(lectures.write_prompt(course, n, total, lec, seg),
+                                                       LECTURES_MODEL, max_tokens=4000))
+        if post is None:
+            raise RuntimeError("Claude ответил не в том формате")
+        if post.get("skip"):  # сюжет оказался организационным
+            st["used"].append(fid)
+            used.add(fid)
+            state.save()
+            continue
+        quote_ru = None
+        passage = lectures.extract_quote(lectures.segment_text(lec, seg), post.get("quote_start"),
+                                         post.get("quote_end"))
+        if passage:
+            quote_ru = (await claude_text(lectures.translate_prompt(course, passage), LECTURES_MODEL,
+                                          max_tokens=4000)).strip() or None
+        else:
+            log.info("Конспект %s: якоря цитаты не нашлись в расшифровке", fid)
+        return {"fragment": fid, "course": cid, "title": post["title"], "tags": lectures.post_tags(post, course),
+                "text": lectures.build_post(post, course, n, total, lec, seg, quote_ru),
+                "preview": lectures.video_url(lec, seg)}
+    return None
+
+
+async def publish_lecture(bot, client, channels, st, draft, today):
+    await broadcast(bot, client, channels, lambda lim: draft["text"], [], draft.get("preview"))
+    st["used"].append(draft["fragment"])
+    st["posted"] = (st["posted"] + [{"fragment": draft["fragment"], "title": draft["title"], "date": today,
+                                     "tags": draft["tags"]}])[-1000:]
+    st["last_day"], st["last_course"] = today, draft["course"]
+    st.pop("draft", None)
+    state.save()
+    log.info("Конспект %s: %s", draft["fragment"], draft["title"])
+
+
+async def check_lectures(bot, force=False, preview=False):
+    """Раз в день, после LECTURES_HOUR, один конспект сюжета лекции.
+
+    force - не ждать часа и не смотреть, был ли пост сегодня (/check, /publish).
+    preview - не публиковать, а прислать владельцу черновик; он уйдет в канал следующим.
+    """
     async with _lectures_lock:
         channels = state.channels("lectures")
-        if not channels:
+        if not channels and not preview:
             return 0
         st = state.data["lectures"]
         now = datetime.now(timezone(timedelta(hours=LECTURES_UTC_OFFSET)))
         today = now.date().isoformat()
-        state.data["last"]["lectures"] = time.time()
+        if not preview:
+            state.data["last"]["lectures"] = time.time()
         if not force and (now.hour < LECTURES_HOUR or st.get("last_day") == today):
             state.save()
             return 0
@@ -1293,46 +1372,29 @@ async def check_lectures(bot, force=False):
             return 0
         try:
             async with httpx.AsyncClient() as client:
-                for cid, course in lectures.COURSES.items():
-                    if not st["lists"].get(cid):
-                        r = await http_get(client, course["url"])
-                        st["lists"][cid] = lectures.lecture_numbers(r.text, cid)
-                for _ in range(5):
-                    choice = lectures.pick(list(lectures.COURSES), st["lists"], set(st["exhausted"]),
-                                           st.get("last_course"))
-                    if not choice:
-                        await notify_owner(bot, "lectures", "Конспекты: все главы всех курсов уже использованы. "
-                                                            "Пора добавить новые курсы.")
-                        state.save()
-                        return 0
-                    cid, n = choice
-                    course = lectures.COURSES[cid]
-                    r = await http_get(client, f"{course['url']}/lecture-{n}")
-                    lec = lectures.parse_lecture(r.text)
-                    ch = lectures.choose_chapter(cid, n, lec, set(st["used"]))
-                    if not ch:
-                        st["exhausted"].append(f"{cid}/{n}")
-                        continue
-                    fid = lectures.fragment_id(cid, n, ch["n"])
-                    raw = await claude_text(lectures.build_prompt(course, n, lec, ch), LECTURES_MODEL,
-                                            max_tokens=3000)
-                    post = lectures.parse_answer(raw)
-                    if post is None:
-                        raise RuntimeError("Claude ответил не в том формате")
-                    st["used"].append(fid)
-                    if post.get("skip"):  # организационная глава
-                        state.save()
-                        continue
-                    text = lectures.build_post(post, course, n, lec, ch)
-                    await broadcast(bot, client, channels, lambda lim: text, [])
-                    st["posted"] = (st["posted"] + [{"fragment": fid, "title": post["title"], "date": today,
-                                                     "tags": lectures.post_tags(post, course)}])[-1000:]
-                    st["last_day"], st["last_course"] = today, cid
+                draft = None if preview else st.get("draft")
+                if not draft:
+                    draft = await lecture_draft(bot, client, st)
+                if not draft:
+                    await notify_owner(bot, "lectures", "Конспекты: все сюжеты всех курсов уже использованы. "
+                                                        "Пора добавить новые курсы.")
                     state.save()
-                    log.info("Конспект %s: %s", fid, post["title"])
+                    return 0
+                if preview:
+                    st["draft"] = draft
+                    state.save()
+                    await send_post(bot, client, OWNER_ID, lambda lim: draft["text"], [], draft.get("preview"))
+                    await bot.send_message(OWNER_ID, "Это черновик, в канал он пока не ушел. Он выйдет следующим "
+                                                     "по расписанию. Опубликовать сейчас: /publish. "
+                                                     "Другой черновик: /check lectures.")
                     return 1
+                await publish_lecture(bot, client, channels, st, draft, today)
+                return 1
         except Exception as e:
             log.exception("Конспекты: ошибка")
+            if preview or force:  # ручной запуск: ошибку покажет сама команда
+                state.save()
+                raise
             await notify_owner(bot, "lectures", f"Конспекты: не получилось подготовить пост ({type(e).__name__}: {e}). "
                                                 "Попробую позже.")
         state.save()
@@ -1418,6 +1480,7 @@ async def cmd_start(update, context):
         "Команды здесь:\n"
         "/list - источники, каналы и чьи ленты Letterboxd читаю\n"
         "/check - проверить все источники сейчас (или /check kanoner)\n"
+        "/check lectures - черновик конспекта мне в личку, /publish - выпустить его в канал\n"
         "/add ник, /remove ник - люди на Letterboxd"
     )
 
@@ -1491,12 +1554,30 @@ async def cmd_check(update, context):
         await update.message.reply_text(f"Проверяю {name}...")
         try:
             fn = SOURCES[name]["check"]
-            n = await (fn(context.bot, force=True) if name == "lectures" else fn(context.bot))
+            if name == "lectures":  # конспект сначала владельцу
+                n = await fn(context.bot, force=True, preview=True)
+                lines.append(f"{name}: черновиков {n}")
+                continue
+            n = await fn(context.bot)
             lines.append(f"{name}: новых постов {n}")
         except Exception as e:
             log.exception("Ручная проверка %s", name)
-            lines.append(f"{name}: ошибка ({type(e).__name__})")
+            lines.append(f"{name}: ошибка ({type(e).__name__}: {str(e)[:300]})")
     await update.message.reply_text("\n".join(lines))
+
+
+@owner_only
+async def cmd_publish(update, context):
+    """Черновик конспекта (или новый, если черновика нет) - в канал сейчас."""
+    if not state.channels("lectures"):
+        await update.message.reply_text("lectures не подключен к каналу")
+        return
+    try:
+        n = await check_lectures(context.bot, force=True)
+    except Exception as e:
+        await update.message.reply_text(f"Не получилось: {type(e).__name__}: {str(e)[:300]}")
+        return
+    await update.message.reply_text("Конспект опубликован." if n else "Публиковать нечего.")
 
 
 @owner_only
@@ -1563,6 +1644,7 @@ def main():
     app.add_handler(CommandHandler("remove", cmd_remove))
     app.add_handler(CommandHandler("check", cmd_check))
     app.add_handler(CommandHandler("x", cmd_x))
+    app.add_handler(CommandHandler("publish", cmd_publish))
     app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST, channel_command))
     log.info("Лента запущена, источники: %s", ", ".join(SOURCES))
     app.run_polling(allowed_updates=Update.ALL_TYPES)
