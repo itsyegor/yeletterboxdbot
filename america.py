@@ -37,7 +37,38 @@ TG_CHANNELS = {
     "izdaniya": "Подписные издания",
     "dklurie": "ДК Льва Лурье",
     "domradio_online": "Дом Радио",
+    "prozhito": "Прожито (Европейский университет)",
+    "brodsky_online_museum": "Музей «Полторы комнаты»",
 }
+
+# Закрытый словарь тегов. Модель выбирает из него, новых не придумывает.
+# Тип поста (#анонс, #конспект...) и источник (#Блайт...) ставит сам бот.
+TAGS_ERA = [
+    "колонии", "революция", "Конституция", "ранняяреспублика", "джексоновскаяэра", "довоенныйкризис",
+    "гражданскаявойна", "Реконструкция", "позолоченныйвек", "прогрессивнаяэра", "двадцатые", "Депрессия",
+    "НовыйКурс", "ВтораяМировая", "холоднаявойна", "шестидесятые", "современность",
+]
+TAGS_THEME = [
+    "рабство", "аболиционизм", "индейцы", "фронтир", "ДикийЗапад", "иммиграция", "сегрегация",
+    "гражданскиеправа", "право", "Верховныйсуд", "федерализм", "выборы", "партии", "президенты",
+    "внешняяполитика", "РоссияиСША", "экономика", "железныедороги", "промышленность", "профсоюзы",
+    "религия", "города", "архитектура", "литература", "кино", "Голливуд", "джаз", "музыка", "танец",
+    "живопись", "мода",
+]
+_TAG_INDEX = {t.lower(): t for t in TAGS_ERA + TAGS_THEME}
+
+EVENT_KINDS = ["лекция", "беседа", "дискуссия", "семинар", "круглый стол", "презентация книги",
+               "открытое занятие", "кинопоказ с обсуждением"]
+
+
+def clean_tags(tags, limit=4):
+    """Оставляет только теги из словаря, в каноническом написании, без повторов."""
+    out = []
+    for t in tags or []:
+        canon = _TAG_INDEX.get(str(t).strip().lstrip("#").replace(" ", "").lower())
+        if canon and canon not in out:
+            out.append(canon)
+    return out[:limit]
 
 # RSS
 FEEDS = [
@@ -150,6 +181,40 @@ def page_text(page_html, base_url, limit=40000):
 def digest(text):
     return hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:16]
 
+
+def strip_urls(text):
+    """Убирает ссылки, которые text_with_links вписал в текст: для цитаты они не нужны."""
+    text = re.sub(r"\s*\(https?://[^)\s]+\)", "", text or "")
+    text = re.sub(r"https?://\S+", "", text)
+    return re.sub(r"[ \t]+\n", "\n", text).strip()
+
+
+def _norm(s):
+    s = (s or "").lower().replace("ё", "е")
+    s = re.sub(r"[«»\"“”„']", "", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def event_quote(ev, limit=2500):
+    """Оригинальный текст анонса для свернутой цитаты.
+
+    Берем фрагмент, который вернула модель, только если он дословно есть в источнике.
+    Иначе - весь пост, если он короткий. Страницу афиши целиком не цитируем.
+    """
+    plain = strip_urls(ev.get("source_text") or "")
+    quote = strip_urls(ev.get("quote") or "")
+    if quote and len(_norm(quote)) > 40 and _norm(quote) in _norm(plain):
+        text = quote
+    elif ev.get("source_kind") == "post" and 0 < len(plain) <= 3000:
+        text = plain
+    else:
+        return None
+    # строки, от которых после удаления ссылки осталась одна подпись: «Регистрация», «Билеты»...
+    text = "\n".join(l for l in text.split("\n")
+                     if not re.fullmatch(r"\W*(регистрация|билеты|купить билет\w*|подробнее)\b.{0,40}", l.strip(), re.I))
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
 # ─── Timepad ────────────────────────────────────────────────────────────────
 
 def timepad_candidates(data):
@@ -185,9 +250,27 @@ PROMPT = """Ты отбираешь анонсы для канала об аме
 Ничего не выдумывай: каждое поле бери из текста материала, если поля нет - null.
 
 Ответь только JSON-массивом без пояснений. Для каждого подходящего события объект:
-{{"src": номер материала, "title": "название как в анонсе", "lecturer": "лектор и кратко кто он, или null", "date": "ГГГГ-ММ-ДД", "time": "ЧЧ:ММ или null", "venue": "площадка", "address": "адрес или null", "price": "как в анонсе, например «800 ₽» или «бесплатно, по регистрации», или null", "link": "ссылка на регистрацию, билеты или страницу события из текста, или null", "summary": "одно-два предложения о содержании в академическом тоне: о чем лекция, какие вопросы рассматриваются; без оценок, восклицаний и рекламных слов"}}
+{{"src": номер материала,
+ "kind": "одно из: {kinds}",
+ "title": "название как в анонсе, без кавычек вокруг",
+ "speakers": [{{"name": "имя и фамилия", "about": "кто это, коротко, как в анонсе, или null"}}],
+ "date": "ГГГГ-ММ-ДД", "time": "ЧЧ:ММ или null",
+ "venue": "площадка", "address": "адрес или null",
+ "price": "как в анонсе, например «800 ₽» или «бесплатно, по регистрации», или null",
+ "link": "ссылка на регистрацию, билеты или страницу события из текста, или null",
+ "gist": "одна-две фразы: что конкретно будет на встрече",
+ "quote": "дословный фрагмент материала об этом событии",
+ "tags": ["2-4 тега из списка ниже"]}}
 
-Если подходящих нет - ответь [].
+Как писать gist. Только факты из анонса: предмет, период, имена, то, что будет сделано. Не начинай с «На лекции», «Лектор расскажет», «Мы узнаем», «Слушатели узнают». Не пиши «рассматриваются вопросы», «увлекательный», «уникальный», без восклицаний. Букву «ё» не используй. Если у встречи есть вторая часть (мастер-класс, показ, обсуждение), назови ее. Пример хорошего gist: «Как джазовый танец перешел с вечеринок на сцену — от импровизации к постановкам Баланчина и Фосси. Вторая часть встречи — мастер-класс по соло-джазу.»
+
+Как брать quote. Скопируй из материала описание именно этого события, слово в слово, ничего не меняя и не сокращая внутри. Без ссылок, без расписания других событий, без призывов подписаться. Если в материале несколько событий, бери только абзац об этом.
+
+Теги. Выбери 2-4, которые прямо следуют из анонса: эпоху, если она названа или очевидна, и тему. Только из этого списка, без решетки:
+Эпохи: {era}
+Темы: {theme}
+
+Если подходящих событий нет - ответь [].
 
 {items}"""
 
@@ -201,6 +284,7 @@ def build_prompt(candidates, today):
         blocks.append(f"{head}\n{c['text']}")
     days = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
     return PROMPT.format(today=f"{today.isoformat()}, {days[today.weekday()]}",
+                         kinds=", ".join(EVENT_KINDS), era=", ".join(TAGS_ERA), theme=", ".join(TAGS_THEME),
                          items="\n\n---\n\n".join(blocks))
 
 
@@ -287,29 +371,68 @@ def _cut(s, n):
     return s if len(s) <= n else s[: n - 1].rstrip() + "…"
 
 
+def event_tags(ev):
+    """Хэштеги анонса: тип ставит бот, остальное - из словаря."""
+    return ["анонс"] + clean_tags(ev.get("tags"))
+
+
+def _speakers(ev):
+    sp = ev.get("speakers")
+    if isinstance(sp, list) and sp:
+        return [s for s in sp if isinstance(s, dict) and s.get("name")]
+    if ev.get("lecturer"):  # старый формат ответа
+        return [{"name": ev["lecturer"], "about": None}]
+    return []
+
+
 def build_post(ev):
-    """Текст анонса (HTML для Telegram). Поля обрезаются заранее, чтобы не резать разметку."""
-    lines = [f"<b>{_esc(_cut(ev['title'], 300))}</b>"]
-    if ev.get("lecturer"):
-        lines.append(_esc(_cut(ev["lecturer"], 300)))
-    lines.append("")
-    lines.append(human_date(ev["date"], ev.get("time")))
-    place = ", ".join(str(x) for x in [ev.get("venue"), ev.get("address")] if x)
+    """Текст анонса (HTML для Telegram). Поля обрезаются заранее, чтобы не резать разметку.
+
+    🎟 ЛЕКЦИЯ · 14 ноября, сб, 17:00
+    Название
+    Суть в одну-две фразы
+    Лектор, кто он / 📍 площадка, адрес / цена
+    Свернутая цитата: оригинальный текст анонса
+    Регистрация · Источник
+    #анонс #теги
+    """
+    kind = str(ev.get("kind") or "").strip().lower()
+    kind = kind if kind in EVENT_KINDS else "лекция"
+    lines = [f"🎟 <b>{_esc(kind.upper())} · {human_date(ev['date'], ev.get('time'))}</b>",
+             "",
+             f"<b>{_esc(_cut(ev['title'], 300))}</b>"]
+
+    gist = ev.get("gist") or ev.get("summary")
+    if gist:
+        lines += ["", _esc(_cut(gist, 600))]
+
+    facts = []
+    for s in _speakers(ev)[:4]:
+        line = f"<b>{_esc(_cut(strip_urls(s['name']), 100))}</b>"
+        if s.get("about"):
+            line += f", <i>{_esc(_cut(strip_urls(s['about']), 200))}</i>"
+        facts.append(line)
+    place = ", ".join(strip_urls(str(x)) for x in [ev.get("venue"), ev.get("address")] if x)
     if place:
-        lines.append(_esc(_cut(place, 300)))
+        facts.append("📍 " + _esc(_cut(place, 300)))
     if ev.get("price"):
-        lines.append(_esc(_cut(ev["price"], 200)))
-    if ev.get("summary"):
-        lines.append("")
-        lines.append(_esc(_cut(ev["summary"], 900)))
+        facts.append(_esc(_cut(strip_urls(str(ev["price"])), 200)))
+    if facts:
+        lines += [""] + facts
+
+    quote = event_quote(ev)
+    if quote:
+        lines += ["", f"<blockquote expandable>{_esc(quote)}</blockquote>"]
+
     links = []
     if ev.get("link") and str(ev["link"]).startswith("http"):
-        links.append(f'<a href="{_href(ev["link"])}">Регистрация и подробности</a>')
+        links.append(f'<a href="{_href(ev["link"])}">Регистрация</a>')
     if ev.get("source_url") and ev.get("source_url") != ev.get("link"):
         links.append(f'<a href="{_href(ev["source_url"])}">Источник: {_esc(ev.get("source"))}</a>')
     elif ev.get("source"):
         links.append(f"Источник: {_esc(ev['source'])}")
+    lines.append("")
     if links:
-        lines.append("")
         lines.append(" · ".join(links))
+    lines.append(" ".join("#" + t for t in event_tags(ev)))
     return "\n".join(lines)

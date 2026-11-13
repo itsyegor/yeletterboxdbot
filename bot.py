@@ -1202,6 +1202,7 @@ async def check_america(bot):
                     if not america.valid_event(ev, today):
                         continue
                     ev["source"], ev["source_url"] = src["source"], src["url"]
+                    ev["source_text"], ev["source_kind"] = src["text"], src.get("kind")
                     found.append(ev)
         except Exception as e:
             log.exception("Американистика: Claude не ответил")
@@ -1235,7 +1236,8 @@ async def check_america(bot):
                 except Exception:
                     log.exception("Анонс не отправлен: %s", ev.get("title"))
                     continue
-                st["posted"] = (st["posted"] + [{"date": str(ev["date"])[:10], "title": ev["title"]}])[-500:]
+                st["posted"] = (st["posted"] + [{"date": str(ev["date"])[:10], "title": ev["title"],
+                                                 "tags": america.event_tags(ev), "source": ev.get("source_url")}])[-500:]
                 posted += 1
                 state.save()
                 await asyncio.sleep(3)
