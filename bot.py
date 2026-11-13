@@ -37,7 +37,7 @@ import america
 import lectures
 from telegram import Update, InputMediaPhoto, LinkPreviewOptions
 from telegram.constants import ParseMode
-from telegram.error import RetryAfter, TelegramError
+from telegram.error import RetryAfter, TelegramError, TimedOut
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -479,7 +479,7 @@ def fit(builder, limit):
 
 # ─── Отправка в Telegram ────────────────────────────────────────────────────
 
-async def tg_call(fn, *args, **kwargs):
+async def _tg_call(fn, *args, **kwargs):
     for attempt in range(3):
         try:
             return await fn(*args, **kwargs)
@@ -499,11 +499,26 @@ async def download(client, url):
     return r.content
 
 
-async def send_post(bot, client, chat_id, text_builder, images, preview_url=None):
+async def send_post(bot, client, chat_id, text_builder, images, preview_url=None, delivered=None):
     """Пост с одной картинкой или альбомом. text_builder(limit) -> текст.
 
     preview_url - пост без картинки, но с превью этой ссылки над текстом (видео YouTube).
+    delivered - [False]; становится [True], как только хоть одно сообщение поста дошло до канала.
     """
+    delivered = delivered if delivered is not None else [False]
+
+    async def tg_call(fn, *args, **kwargs):
+        # Telegram часто успевает принять сообщение, но не ответить вовремя (альбом из 10 фото).
+        # Повтор в этом случае дает дубль, поэтому таймаут считаем доставкой.
+        try:
+            result = await _tg_call(fn, *args, **kwargs)
+        except TimedOut:
+            log.warning("Telegram не ответил вовремя на %s, считаю отправленным", getattr(fn, "__name__", fn))
+            delivered[0] = True
+            return None
+        delivered[0] = True
+        return result
+
     if preview_url and not images:
         msg = await tg_call(bot.send_message, chat_id, text=text_builder(MESSAGE_LIMIT), parse_mode=ParseMode.HTML,
                             link_preview_options=LinkPreviewOptions(url=preview_url, prefer_large_media=True,
@@ -562,11 +577,14 @@ async def broadcast(bot, client, channels, text_builder, images, preview_url=Non
     """Один пост во все каналы источника. Ошибка в одном канале не мешает остальным."""
     sent = 0
     for chat_id in channels:
+        delivered = [False]
         try:
-            await send_post(bot, client, chat_id, text_builder, images, preview_url)
+            await send_post(bot, client, chat_id, text_builder, images, preview_url, delivered)
             sent += 1
         except Exception:
             log.exception("Пост не ушел в канал %s", chat_id)
+            if delivered[0]:
+                sent += 1  # часть поста уже в канале: повторять целиком нельзя, будет дубль
     if channels and not sent:
         raise RuntimeError("пост не ушел ни в один канал")
 
@@ -1666,7 +1684,9 @@ def main():
     global state
     state = State(STATE_DIR)
     state.save()
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(post_init).build()
+    app = (ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(post_init)
+           .connect_timeout(20).read_timeout(60).write_timeout(60).media_write_timeout(120)
+           .build())
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("add", cmd_add))
