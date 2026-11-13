@@ -1074,6 +1074,21 @@ async def claude_text(prompt, model, max_tokens=4000):
     return "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
 
 
+async def claude_json(prompt, model, schema, max_tokens=4000):
+    """Ответ строго по схеме через инструмент: JSON всегда валидный, кавычки в тексте ничего не ломают."""
+    import anthropic
+    client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+    resp = await client.messages.create(
+        model=model, max_tokens=max_tokens, messages=[{"role": "user", "content": prompt}],
+        tools=[{"name": "answer", "description": "Ответ на задание", "input_schema": schema}],
+        tool_choice={"type": "tool", "name": "answer"})
+    for b in resp.content:
+        if getattr(b, "type", "") == "tool_use":
+            return b.input
+    log.warning("Claude не вызвал инструмент, stop_reason=%s", resp.stop_reason)
+    return None
+
+
 async def america_tg(client, handle, last):
     """Новые посты канала после last (на первой проверке - все, что видно). -> (посты, номер последнего)."""
     r = await http_get(client, f"https://t.me/s/{handle}")
@@ -1302,7 +1317,8 @@ async def lecture_draft(bot, client, st):
         key = f"{cid}/{n}"
         segs = st["segments"].get(key)
         if segs is None:
-            raw = await claude_text(lectures.segment_prompt(course, n, lec), LECTURES_MODEL, max_tokens=2000)
+            raw = await claude_json(lectures.segment_prompt(course, n, lec), LECTURES_MODEL,
+                                    lectures.SEGMENT_SCHEMA, max_tokens=2000)
             segs = lectures.parse_segments(raw, lec)
             if segs is None:
                 raise RuntimeError("Claude не разбил лекцию на сюжеты")
@@ -1314,10 +1330,12 @@ async def lecture_draft(bot, client, st):
             continue
         fid = lectures.fragment_id(cid, n, seg)
         total = len(st["lists"][cid])
-        post = lectures.parse_answer(await claude_text(lectures.write_prompt(course, n, total, lec, seg),
-                                                       LECTURES_MODEL, max_tokens=4000))
+        raw = await claude_json(lectures.write_prompt(course, n, total, lec, seg), LECTURES_MODEL,
+                                lectures.WRITE_SCHEMA, max_tokens=6000)
+        post = lectures.parse_answer(raw)
         if post is None:
-            raise RuntimeError("Claude ответил не в том формате")
+            log.warning("Конспект %s: ответ без заголовка или текста: %r", fid, raw)
+            raise RuntimeError(f"в ответе Claude нет заголовка или текста (ключи: {sorted(raw or {})})")
         if post.get("skip"):  # сюжет оказался организационным
             st["used"].append(fid)
             used.add(fid)

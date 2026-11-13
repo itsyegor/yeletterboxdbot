@@ -111,7 +111,7 @@ SEGMENT_PROMPT = """Ниже расшифровка лекции {author_gen}, �
 - Организационное (объявления о курсе, экзаменах, списке чтения) и короткие связки в сюжеты не включай.
 - topic - одна фраза по-русски: о чем сюжет и к какой мысли он ведет.
 
-Ответ - только JSON:
+Ответ - через инструмент answer:
 {{"segments": [{{"chapters": [1, 2], "topic": "..."}}]}}
 
 Главы:
@@ -119,6 +119,29 @@ SEGMENT_PROMPT = """Ниже расшифровка лекции {author_gen}, �
 
 Расшифровка:
 {text}"""
+
+
+SEGMENT_SCHEMA = {
+    "type": "object",
+    "properties": {"segments": {"type": "array", "items": {
+        "type": "object",
+        "properties": {"chapters": {"type": "array", "items": {"type": "integer"}}, "topic": {"type": "string"}},
+        "required": ["chapters", "topic"]}}},
+    "required": ["segments"],
+}
+
+WRITE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "skip": {"type": "boolean", "description": "true, только если фрагмент организационный"},
+        "title": {"type": "string"}, "intro": {"type": "string"},
+        "body": {"type": "string", "description": "абзацы через пустую строку"},
+        "verdict": {"type": "string"},
+        "quote_start": {"type": "string", "description": "первые 6-10 слов отрывка, дословно"},
+        "quote_end": {"type": "string", "description": "последние 6-10 слов отрывка, дословно"},
+        "tags": {"type": "array", "items": {"type": "string"}},
+    },
+}
 
 
 def segment_prompt(course, lecture_no, lecture):
@@ -130,6 +153,8 @@ def segment_prompt(course, lecture_no, lecture):
 
 
 def _json(raw):
+    if isinstance(raw, dict):  # ответ через инструмент уже разобран
+        return raw
     m = re.search(r"\{.*\}", raw or "", re.S)
     if not m:
         return None
@@ -225,7 +250,7 @@ WRITE_PROMPT = """Ты ведешь телеграм-канал об амери�
 
 Если фрагмент все же организационный и содержательного поста не выходит, ответь {{"skip": true}}.
 
-Ответ - только JSON:
+Ответ - через инструмент answer:
 {{"title": "...", "intro": "...", "body": "абзацы через пустую строку", "verdict": "...", "quote_start": "...", "quote_end": "...", "tags": ["..."]}}
 
 Расшифровка фрагмента:
