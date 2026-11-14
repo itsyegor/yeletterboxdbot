@@ -1550,21 +1550,23 @@ async def lecture_draft(bot, client, st):
             used.add(fid)
             state.save()
             continue
-        raw = await claude_text(lectures.post_prompt(course, n, lec, seg, notes), LECTURES_MODEL, max_tokens=5000)
-        # второй проход - редактор: раскрыть намеки, убрать лишнее, разбить длинные абзацы
-        edited = await claude_text(lectures.edit_prompt(raw, lectures.segment_text(lec, seg)), LECTURES_MODEL,
-                                   max_tokens=5000)
-        post = lectures.parse_post(edited) or lectures.parse_post(raw)
-        if post is None:
-            raise RuntimeError("Claude не написал пост по заметкам")
-        post["tags"] = notes.get("tags")
+        # цитата - до текста: автор поста должен знать, что в ней, чтобы не пересказывать то же самое
         quote_ru = None
         passages = lectures.extract_quotes(lectures.segment_text(lec, seg), notes.get("quote"))
         if passages:
             quote_ru = (await claude_text(lectures.translate_prompt(course, passages), LECTURES_MODEL,
                                           max_tokens=5000)).strip() or None
-        else:
+        elif notes.get("quote"):
             log.info("Конспект %s: куски цитаты не нашлись в расшифровке: %r", fid, notes.get("quote"))
+        raw = await claude_text(lectures.post_prompt(course, n, lec, seg, notes, quote_ru), LECTURES_MODEL,
+                                max_tokens=5000)
+        # второй проход - редактор: раскрыть намеки, убрать лишнее и повторы цитаты, разбить длинные абзацы
+        edited = await claude_text(lectures.edit_prompt(raw, lectures.segment_text(lec, seg), quote_ru),
+                                   LECTURES_MODEL, max_tokens=5000)
+        post = lectures.parse_post(edited) or lectures.parse_post(raw)
+        if post is None:
+            raise RuntimeError("Claude не написал пост по заметкам")
+        post["tags"] = notes.get("tags")
         image = await lecture_image(client, notes.get("images"),
                                     "\n\n".join([post["title"], post["before"], post["after"]]))
         return {"fragment": fid, "course": cid, "title": post["title"], "tags": lectures.post_tags(post, course),
@@ -1767,17 +1769,18 @@ async def article_draft(client, st):
             used.add(item["url"])
             state.save()
             continue
-        raw = await claude_text(articles.post_prompt(item, notes), LECTURES_MODEL, max_tokens=5000)
-        edited = await claude_text(lectures.edit_prompt(raw, item["text"]), LECTURES_MODEL, max_tokens=5000)
-        post = lectures.parse_post(edited) or lectures.parse_post(raw)
-        if post is None:
-            raise RuntimeError("Claude не написал пост по статье")
-        post["tags"] = notes.get("tags")
         quote_ru = None
         passages = lectures.extract_quotes(item["text"], notes.get("quote"))
         if passages:
             quote_ru = (await claude_text(articles.translate_prompt(passages), LECTURES_MODEL,
                                           max_tokens=5000)).strip() or None
+        raw = await claude_text(articles.post_prompt(item, notes, quote_ru), LECTURES_MODEL, max_tokens=5000)
+        edited = await claude_text(lectures.edit_prompt(raw, item["text"], quote_ru), LECTURES_MODEL,
+                                   max_tokens=5000)
+        post = lectures.parse_post(edited) or lectures.parse_post(raw)
+        if post is None:
+            raise RuntimeError("Claude не написал пост по статье")
+        post["tags"] = notes.get("tags")
         image = await lecture_image(client, notes.get("images"),
                                     "\n\n".join([post["title"], post["before"], post["after"]]))
         return {"fragment": item["url"], "source": sid, "title": post["title"],
