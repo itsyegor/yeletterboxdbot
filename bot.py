@@ -1547,10 +1547,45 @@ async def lecture_draft(bot, client, st):
                                           max_tokens=5000)).strip() or None
         else:
             log.info("Конспект %s: куски цитаты не нашлись в расшифровке: %r", fid, notes.get("quote"))
+        image = await lecture_image(client, notes.get("images"),
+                                    "\n\n".join([post["title"], post["before"], post["after"]]))
         return {"fragment": fid, "course": cid, "title": post["title"], "tags": lectures.post_tags(post, course),
-                "text": lectures.build_post(post, course, n, total, lec, seg, quote_ru),
-                "preview": lectures.video_url(lec, seg)}
+                "text": lectures.build_post(post, course, n, total, lec, seg, quote_ru, image=image),
+                "preview": image["thumb"] if image else None}
     return None
+
+
+async def lecture_image(client, queries, post_text):
+    """Иллюстрация с Wikimedia Commons: поиск по запросам из заметок, выбор и подпись - Claude.
+
+    -> кандидат с полем caption или None. Ошибка поиска не мешает посту выйти без картинки.
+    """
+    seen, cands = set(), []
+    for q in (queries or [])[:3]:
+        try:
+            r = await client.get(lectures.COMMONS_API, params=lectures.commons_params(str(q)),
+                                 headers={"User-Agent": lectures.COMMONS_UA}, timeout=30)
+            r.raise_for_status()
+            for c in lectures.commons_candidates(r.json()):
+                if c["title"] not in seen:
+                    seen.add(c["title"])
+                    cands.append(c)
+        except Exception as e:
+            log.info("Commons: поиск %r не удался (%s)", q, e)
+    if not cands:
+        log.info("Commons: картинок не нашлось по %r", queries)
+        return None
+    cands = cands[:15]
+    ans = await claude_json(lectures.pick_prompt(post_text, cands), LECTURES_MODEL, lectures.PICK_SCHEMA,
+                            max_tokens=800)
+    try:
+        i = int((ans or {}).get("choice", -1))
+    except (TypeError, ValueError):
+        i = -1
+    if not 0 <= i < len(cands) or not (ans or {}).get("caption"):
+        log.info("Commons: подходящей картинки нет")
+        return None
+    return dict(cands[i], caption=ans["caption"])
 
 
 async def publish_lecture(bot, client, channels, st, draft, today):
