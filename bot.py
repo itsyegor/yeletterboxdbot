@@ -1550,8 +1550,11 @@ async def lecture_draft(bot, client, st):
             used.add(fid)
             state.save()
             continue
-        post = lectures.parse_post(await claude_text(lectures.post_prompt(course, n, lec, seg, notes),
-                                                     LECTURES_MODEL, max_tokens=5000))
+        raw = await claude_text(lectures.post_prompt(course, n, lec, seg, notes), LECTURES_MODEL, max_tokens=5000)
+        # второй проход - редактор: раскрыть намеки, убрать лишнее, разбить длинные абзацы
+        edited = await claude_text(lectures.edit_prompt(raw, lectures.segment_text(lec, seg)), LECTURES_MODEL,
+                                   max_tokens=5000)
+        post = lectures.parse_post(edited) or lectures.parse_post(raw)
         if post is None:
             raise RuntimeError("Claude не написал пост по заметкам")
         post["tags"] = notes.get("tags")
@@ -1764,8 +1767,9 @@ async def article_draft(client, st):
             used.add(item["url"])
             state.save()
             continue
-        post = lectures.parse_post(await claude_text(articles.post_prompt(item, notes), LECTURES_MODEL,
-                                                     max_tokens=5000))
+        raw = await claude_text(articles.post_prompt(item, notes), LECTURES_MODEL, max_tokens=5000)
+        edited = await claude_text(lectures.edit_prompt(raw, item["text"]), LECTURES_MODEL, max_tokens=5000)
+        post = lectures.parse_post(edited) or lectures.parse_post(raw)
         if post is None:
             raise RuntimeError("Claude не написал пост по статье")
         post["tags"] = notes.get("tags")
@@ -2087,13 +2091,26 @@ async def cmd_remove(update, context):
     await update.message.reply_text(f"Убрал {nick}.")
 
 
+SOURCE_ALIASES = {  # /check и /publish понимают и русские названия
+    "америка": "america", "анонсы": "america", "лекции": "lectures", "лекция": "lectures",
+    "статьи": "articles", "статья": "articles", "картинки": "pictures", "картинка": "pictures",
+    "летербокс": "letterboxd", "светов": "svetov", "канонер": "kanoner",
+}
+
+
+def source_name(arg):
+    a = arg.lower().strip()
+    return SOURCE_ALIASES.get(a, a)
+
+
 @owner_only
 async def cmd_check(update, context):
-    wanted = [a.lower() for a in context.args] or list(SOURCES)
+    wanted = [source_name(a) for a in context.args] or list(SOURCES)
     unknown = [a for a in wanted if a not in SOURCES]
     if unknown:
         await update.message.reply_text("Таких источников нет: " + ", ".join(unknown) +
-                                        "\nЕсть: " + ", ".join(SOURCES))
+                                        "\nЕсть: " + ", ".join(SOURCES) +
+                                        "\nМожно и по-русски: америка, лекции, статьи, картинки")
         return
     lines = []
     for name in wanted:
@@ -2118,7 +2135,7 @@ async def cmd_check(update, context):
 @owner_only
 async def cmd_publish(update, context):
     """Черновик поста по лекции (/publish) или по статье (/publish articles) - в канал сейчас."""
-    name = (context.args[0].lower() if context.args else "lectures")
+    name = source_name(context.args[0]) if context.args else "lectures"
     if name not in ("lectures", "articles", "pictures"):
         await update.message.reply_text("Можно: /publish, /publish articles или /publish pictures")
         return
