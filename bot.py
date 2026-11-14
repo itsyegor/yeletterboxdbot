@@ -38,6 +38,7 @@ from bs4 import BeautifulSoup
 import america
 import lectures
 import articles
+import pictures
 from telegram import Update, InputMediaPhoto, LinkPreviewOptions
 from telegram.constants import ParseMode
 from telegram.error import RetryAfter, TelegramError, TimedOut
@@ -73,7 +74,8 @@ AMERICA_INTERVAL = float(os.environ.get("AMERICA_INTERVAL_HOURS", "12")) * 3600
 AMERICA_MODEL = os.environ.get("AMERICA_MODEL", CLAUDE_MODEL)
 TIMEPAD_TOKEN = os.environ.get("TIMEPAD_TOKEN", "").strip()
 LECTURES_MODEL = os.environ.get("LECTURES_MODEL", "claude-sonnet-5-5")
-ARTICLES_HOUR = int(os.environ.get("ARTICLES_HOUR", "18"))            # час публикации поста по статье
+ARTICLES_HOUR = int(os.environ.get("ARTICLES_HOUR", "18"))
+PICTURES_HOUR = int(os.environ.get("PICTURES_HOUR", "14"))            # час картинки (только по будням)            # час публикации поста по статье
 LECTURES_HOUR = int(os.environ.get("LECTURES_HOUR", "10"))            # час публикации конспекта
 LECTURES_UTC_OFFSET = float(os.environ.get("LECTURES_UTC_OFFSET", "5"))  # Алматы
 
@@ -138,6 +140,9 @@ class State:
         ar.setdefault("pages", {})         # источник -> {"max": число страниц ленты, "checked": время}
         ar.setdefault("used", [])          # ссылки на статьи, по которым уже был пост или которые не подошли
         ar.setdefault("posted", [])        # журнал: ссылка, заголовок, теги, дата
+        pc = self.data.setdefault("pictures", {})
+        pc.setdefault("used", [])          # файлы Commons, по которым уже был пост
+        pc.setdefault("posted", [])        # журнал: файл, заголовок, эпоха, тема, дата
         self.data.setdefault("errors", {})
         self.data.setdefault("last", {})
         self.data.setdefault("bindings", {})  # источник -> [id каналов]
@@ -165,7 +170,7 @@ class State:
 
     def channels(self, source):
         got = list(self.data["bindings"].get(source, []))
-        if not got and source == "articles":  # статьи по умолчанию идут туда же, куда лекции
+        if not got and source in ("articles", "pictures"):  # по умолчанию туда же, куда лекции
             got = list(self.data["bindings"].get("lectures", []))
         return got
 
@@ -1633,7 +1638,8 @@ async def check_lectures(bot, force=False, preview=False):
         today = now.date().isoformat()
         if not preview:
             state.data["last"]["lectures"] = time.time()
-        if not force and (now.hour < LECTURES_HOUR or st.get("last_day") == today):
+        if not force and (now.hour < LECTURES_HOUR or st.get("last_day") == today
+                          or "lectures" not in todays_slots(now.date())):
             state.save()
             return 0
         if not ANTHROPIC_API_KEY:
@@ -1669,6 +1675,16 @@ async def check_lectures(bot, force=False, preview=False):
                                                 "Попробую позже.")
         state.save()
         return 0
+
+# ─── Расписание длинных постов ──────────────────────────────────────────────
+
+def todays_slots(day):
+    """Что выходит в этот день. Выходные: два длинных поста (лекция и статья).
+    Будни: один длинный (через день лекция или статья) и одна картинка - времени читать меньше."""
+    if day.weekday() >= 5:
+        return {"lectures", "articles"}
+    return {"lectures" if day.toordinal() % 2 == 0 else "articles", "pictures"}
+
 
 # ─── Статьи ─────────────────────────────────────────────────────────────────
 
@@ -1778,7 +1794,8 @@ async def check_articles(bot, force=False, preview=False):
         today = now.date().isoformat()
         if not preview:
             state.data["last"]["articles"] = time.time()
-        if not force and (now.hour < ARTICLES_HOUR or st.get("last_day") == today):
+        if not force and (now.hour < ARTICLES_HOUR or st.get("last_day") == today
+                          or "articles" not in todays_slots(now.date())):
             state.save()
             return 0
         if not ANTHROPIC_API_KEY:
@@ -1820,6 +1837,112 @@ async def check_articles(bot, force=False, preview=False):
         state.save()
         return 0
 
+# ─── Картинки ───────────────────────────────────────────────────────────────
+
+_pictures_lock = asyncio.Lock()
+
+
+async def picture_draft(client, st):
+    used = set(st["used"])
+    recent = st["posted"][-12:]
+    era, theme = pictures.pick_theme([p.get("era") for p in recent] + [p.get("theme") for p in recent])
+    ideas = await claude_json(pictures.ideas_prompt(era, theme, [p["title"] for p in st["posted"]]),
+                              LECTURES_MODEL, pictures.IDEAS_SCHEMA, max_tokens=600)
+    cands, seen = [], set()
+    for q in ((ideas or {}).get("queries") or [])[:5]:
+        try:
+            r = await client.get(lectures.COMMONS_API, params=lectures.commons_params(str(q)),
+                                 headers={"User-Agent": lectures.COMMONS_UA}, timeout=30, follow_redirects=True)
+            r.raise_for_status()
+            for c in lectures.commons_candidates(r.json()):
+                if c["title"] not in seen and c["title"] not in used:
+                    seen.add(c["title"])
+                    cands.append(c)
+        except Exception as e:
+            log.info("Картинка дня: поиск %r не удался (%s)", q, e)
+    cands = sorted(cands, key=lambda c: -c.get("usage", 0))[:15]
+    if not cands:
+        return None
+    ans = await claude_json(pictures.choose_prompt(cands), LECTURES_MODEL, pictures.CHOOSE_SCHEMA, max_tokens=200)
+    try:
+        cand = cands[int((ans or {}).get("choice", -1))]
+    except (TypeError, ValueError, IndexError):
+        return None
+    if int(ans["choice"]) < 0:
+        return None
+    article, text = "", ""
+    for title in pictures.en_titles(cand)[:2]:  # статья Википедии, где стоит картинка: из нее факты для текста
+        try:
+            r = await client.get(pictures.WIKI_API, params=pictures.wiki_params(title),
+                                 headers={"User-Agent": lectures.COMMONS_UA}, timeout=30)
+            text = pictures.wiki_text(r.json())
+            if text:
+                article = title.replace("_", " ")
+                break
+        except Exception as e:
+            log.info("Картинка дня: статья %r не прочиталась (%s)", title, e)
+    post = pictures.parse_post(await claude_text(pictures.write_prompt(cand, article, text), LECTURES_MODEL,
+                                                 max_tokens=1500))
+    if post is None:
+        raise RuntimeError("Claude не написал текст к картинке")
+    return {"fragment": cand["title"], "title": post["title"], "era": era, "theme": theme,
+            "text": pictures.build_post(post, cand, ans.get("tags")), "preview": cand["thumb"]}
+
+
+async def check_pictures(bot, force=False, preview=False):
+    """По будням, после PICTURES_HOUR, одна картинка с коротким текстом. force и preview - как у лекций."""
+    async with _pictures_lock:
+        channels = state.channels("pictures")
+        if not channels and not preview:
+            return 0
+        st = state.data["pictures"]
+        now = datetime.now(timezone(timedelta(hours=LECTURES_UTC_OFFSET)))
+        today = now.date().isoformat()
+        if not preview:
+            state.data["last"]["pictures"] = time.time()
+        if not force and (now.hour < PICTURES_HOUR or st.get("last_day") == today
+                          or "pictures" not in todays_slots(now.date())):
+            state.save()
+            return 0
+        if not ANTHROPIC_API_KEY:
+            state.save()
+            return 0
+        try:
+            async with httpx.AsyncClient() as client:
+                draft = None if preview else st.get("draft")
+                if not draft:
+                    draft = await picture_draft(client, st)
+                if not draft:
+                    log.info("Картинка дня: подходящей не нашлось, попробую позже")
+                    state.save()
+                    return 0
+                if preview:
+                    st["draft"] = draft
+                    state.save()
+                    await send_post(bot, client, OWNER_ID, lambda lim: draft["text"], [], draft.get("preview"))
+                    await bot.send_message(OWNER_ID, "Это черновик картинки, в канал она пока не ушла. "
+                                                     "Сейчас: /publish pictures. Другая: /check pictures.")
+                    return 1
+                await broadcast(bot, client, channels, lambda lim: draft["text"], [], draft.get("preview"))
+                st["used"].append(draft["fragment"])
+                st["posted"] = (st["posted"] + [{"fragment": draft["fragment"], "title": draft["title"],
+                                                 "era": draft["era"], "theme": draft["theme"],
+                                                 "date": today}])[-1000:]
+                st["last_day"] = today
+                st.pop("draft", None)
+                state.save()
+                log.info("Картинка дня %s: %s", draft["fragment"], draft["title"])
+                return 1
+        except Exception as e:
+            log.exception("Картинка дня: ошибка")
+            if preview or force:
+                state.save()
+                raise
+            await notify_owner(bot, "pictures", f"Картинка дня: не получилось ({type(e).__name__}: {e}). "
+                                                "Попробую позже.")
+        state.save()
+        return 0
+
 # ─── Источники ──────────────────────────────────────────────────────────────
 # Новый источник = функция check_<имя>(bot) + строка здесь.
 
@@ -1829,10 +1952,12 @@ SOURCES = {
     "kanoner":    {"title": "Канонер: стройка и город, Петербург (посты из ВК)", "check": check_kanoner, "every": KANONER_INTERVAL},
     "america":    {"title": "Американистика: очные лекции о США и Канаде в Петербурге", "check": check_america,
                    "every": AMERICA_INTERVAL},
-    "lectures":   {"title": "Американистика: рассказы по лекциям Йеля, раз в день", "check": check_lectures,
+    "lectures":   {"title": "Американистика: рассказы по лекциям Йеля", "check": check_lectures,
                    "every": 1800},
     "articles":   {"title": "Американистика: рассказы по статьям (Prologue, Библиотека Конгресса, JSTOR Daily, "
-                            "American Heritage, Smithsonian), раз в день", "check": check_articles, "every": 1800},
+                            "American Heritage, Smithsonian)", "check": check_articles, "every": 1800},
+    "pictures":   {"title": "Американистика: картинка с коротким текстом, по будням", "check": check_pictures,
+                   "every": 1800},
 }
 
 
@@ -1904,6 +2029,7 @@ async def cmd_start(update, context):
         "/check - проверить все источники сейчас (или /check kanoner)\n"
         "/check lectures - черновик поста по лекции мне в личку, /publish - выпустить его в канал\n"
         "/check articles - черновик поста по статье, /publish articles - выпустить его\n"
+        "/check pictures - черновик картинки, /publish pictures - выпустить ее\n"
         "/add ник, /remove ник - люди на Letterboxd"
     )
 
@@ -1977,7 +2103,7 @@ async def cmd_check(update, context):
         await update.message.reply_text(f"Проверяю {name}...")
         try:
             fn = SOURCES[name]["check"]
-            if name in ("lectures", "articles"):  # длинные посты сначала владельцу
+            if name in ("lectures", "articles", "pictures"):  # посты, которые пишет Claude, сначала владельцу
                 n = await fn(context.bot, force=True, preview=True)
                 lines.append(f"{name}: черновиков {n}")
                 continue
@@ -1993,14 +2119,15 @@ async def cmd_check(update, context):
 async def cmd_publish(update, context):
     """Черновик поста по лекции (/publish) или по статье (/publish articles) - в канал сейчас."""
     name = (context.args[0].lower() if context.args else "lectures")
-    if name not in ("lectures", "articles"):
-        await update.message.reply_text("Можно: /publish или /publish articles")
+    if name not in ("lectures", "articles", "pictures"):
+        await update.message.reply_text("Можно: /publish, /publish articles или /publish pictures")
         return
     if not state.channels(name):
         await update.message.reply_text(f"{name} не подключен к каналу")
         return
     try:
-        n = await (check_lectures if name == "lectures" else check_articles)(context.bot, force=True)
+        n = await {"lectures": check_lectures, "articles": check_articles,
+                   "pictures": check_pictures}[name](context.bot, force=True)
     except Exception as e:
         await update.message.reply_text(f"Не получилось: {type(e).__name__}: {str(e)[:300]}")
         return
