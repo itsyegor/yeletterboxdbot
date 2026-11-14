@@ -20,6 +20,7 @@
   STATE_DIR           папка для памяти бота (по умолчанию /data - туда подключается volume)
 """
 import os
+import random
 import re
 import json
 import html
@@ -36,6 +37,7 @@ from bs4 import BeautifulSoup
 
 import america
 import lectures
+import articles
 from telegram import Update, InputMediaPhoto, LinkPreviewOptions
 from telegram.constants import ParseMode
 from telegram.error import RetryAfter, TelegramError, TimedOut
@@ -71,6 +73,7 @@ AMERICA_INTERVAL = float(os.environ.get("AMERICA_INTERVAL_HOURS", "12")) * 3600
 AMERICA_MODEL = os.environ.get("AMERICA_MODEL", CLAUDE_MODEL)
 TIMEPAD_TOKEN = os.environ.get("TIMEPAD_TOKEN", "").strip()
 LECTURES_MODEL = os.environ.get("LECTURES_MODEL", "claude-sonnet-5-5")
+ARTICLES_HOUR = int(os.environ.get("ARTICLES_HOUR", "18"))            # час публикации поста по статье
 LECTURES_HOUR = int(os.environ.get("LECTURES_HOUR", "10"))            # час публикации конспекта
 LECTURES_UTC_OFFSET = float(os.environ.get("LECTURES_UTC_OFFSET", "5"))  # Алматы
 
@@ -131,6 +134,10 @@ class State:
         lc.setdefault("segments", {})      # "hist-119/5" -> разбивка лекции на сюжеты
         lc.setdefault("exhausted", [])     # лекции, где свободных сюжетов не осталось
         lc.setdefault("posted", [])        # журнал: глава, заголовок, теги, дата
+        ar = self.data.setdefault("articles", {})
+        ar.setdefault("pages", {})         # источник -> {"max": число страниц ленты, "checked": время}
+        ar.setdefault("used", [])          # ссылки на статьи, по которым уже был пост или которые не подошли
+        ar.setdefault("posted", [])        # журнал: ссылка, заголовок, теги, дата
         self.data.setdefault("errors", {})
         self.data.setdefault("last", {})
         self.data.setdefault("bindings", {})  # источник -> [id каналов]
@@ -157,7 +164,10 @@ class State:
         os.replace(tmp, self.path)
 
     def channels(self, source):
-        return list(self.data["bindings"].get(source, []))
+        got = list(self.data["bindings"].get(source, []))
+        if not got and source == "articles":  # статьи по умолчанию идут туда же, куда лекции
+            got = list(self.data["bindings"].get("lectures", []))
+        return got
 
     def bind(self, source, chat_id, title=None):
         lst = self.data["bindings"].setdefault(source, [])
@@ -1575,7 +1585,7 @@ async def lecture_image(client, queries, post_text):
     if not cands:
         log.info("Commons: картинок не нашлось по %r", queries)
         return None
-    cands = cands[:15]
+    cands = sorted(cands, key=lambda c: -c.get("usage", 0))[:12]
     ans = await claude_json(lectures.pick_prompt(post_text, cands), LECTURES_MODEL, lectures.PICK_SCHEMA,
                             max_tokens=800)
     try:
@@ -1651,6 +1661,127 @@ async def check_lectures(bot, force=False, preview=False):
         state.save()
         return 0
 
+# ─── Статьи ─────────────────────────────────────────────────────────────────
+
+_articles_lock = asyncio.Lock()
+
+
+async def feed_pages(client, st, sid):
+    """Сколько страниц в архиве ленты (?paged=N). Ищется раз в неделю: удвоение, потом деление пополам."""
+    info = st["pages"].get(sid) or {}
+    if info.get("max") and time.time() - info.get("checked", 0) < 7 * 86400:
+        return info["max"]
+
+    async def exists(p):
+        r = await client.get(articles.page_url(sid, p), headers=HEADERS, timeout=30, follow_redirects=True)
+        return r.status_code == 200 and "<item>" in r.text
+
+    lo, hi = 1, 16
+    while await exists(hi) and hi < 4096:
+        lo, hi = hi, hi * 2
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if await exists(mid):
+            lo = mid
+        else:
+            hi = mid
+    st["pages"][sid] = {"max": lo, "checked": time.time()}
+    state.save()
+    return lo
+
+
+async def article_draft(client, st):
+    """Пост по случайной статье из архивов. -> черновик или None."""
+    used = set(st["used"])
+    if st.get("draft"):
+        used.add(st["draft"]["fragment"])
+    for sid in articles.pick_source(st.get("last_source")) * 2:
+        pages = await feed_pages(client, st, sid)
+        r = await client.get(articles.page_url(sid, random.randint(1, pages)), headers=HEADERS,
+                             timeout=30, follow_redirects=True)
+        item = articles.choose_item(articles.parse_feed(r.text, sid), used)
+        if not item:
+            continue
+        notes = lectures.parse_answer(await claude_json(articles.notes_prompt(item), LECTURES_MODEL,
+                                                        lectures.NOTES_SCHEMA, max_tokens=6000))
+        if notes is None or notes.get("skip"):  # не об истории США, после 2014 года или пустая
+            log.info("Статьи: пропускаю %s", item["url"])
+            st["used"].append(item["url"])
+            used.add(item["url"])
+            state.save()
+            continue
+        post = lectures.parse_post(await claude_text(articles.post_prompt(item, notes), LECTURES_MODEL,
+                                                     max_tokens=5000))
+        if post is None:
+            raise RuntimeError("Claude не написал пост по статье")
+        post["tags"] = notes.get("tags")
+        quote_ru = None
+        passages = lectures.extract_quotes(item["text"], notes.get("quote"))
+        if passages:
+            quote_ru = (await claude_text(articles.translate_prompt(passages), LECTURES_MODEL,
+                                          max_tokens=5000)).strip() or None
+        image = await lecture_image(client, notes.get("images"),
+                                    "\n\n".join([post["title"], post["before"], post["after"]]))
+        return {"fragment": item["url"], "source": sid, "title": post["title"],
+                "tags": articles.post_tags(post, item),
+                "text": articles.build_post(post, item, quote_ru, image),
+                "preview": image["thumb"] if image else None}
+    return None
+
+
+async def check_articles(bot, force=False, preview=False):
+    """Раз в день, после ARTICLES_HOUR, один пост по статье. force и preview - как у check_lectures."""
+    async with _articles_lock:
+        channels = state.channels("articles")
+        if not channels and not preview:
+            return 0
+        st = state.data["articles"]
+        now = datetime.now(timezone(timedelta(hours=LECTURES_UTC_OFFSET)))
+        today = now.date().isoformat()
+        if not preview:
+            state.data["last"]["articles"] = time.time()
+        if not force and (now.hour < ARTICLES_HOUR or st.get("last_day") == today):
+            state.save()
+            return 0
+        if not ANTHROPIC_API_KEY:
+            state.save()
+            return 0
+        try:
+            async with httpx.AsyncClient() as client:
+                draft = None if preview else st.get("draft")
+                if not draft:
+                    draft = await article_draft(client, st)
+                if not draft:
+                    log.info("Статьи: подходящей статьи не нашлось, попробую позже")
+                    state.save()
+                    return 0
+                if preview:
+                    st["draft"] = draft
+                    state.save()
+                    await send_post(bot, client, OWNER_ID, lambda lim: draft["text"], [], draft.get("preview"))
+                    await bot.send_message(OWNER_ID, "Это черновик поста по статье, в канал он пока не ушел. "
+                                                     "Он выйдет следующим по расписанию. Сейчас: /publish articles. "
+                                                     "Другой черновик: /check articles.")
+                    return 1
+                await broadcast(bot, client, channels, lambda lim: draft["text"], [], draft.get("preview"))
+                st["used"].append(draft["fragment"])
+                st["posted"] = (st["posted"] + [{"fragment": draft["fragment"], "title": draft["title"],
+                                                 "date": today, "tags": draft["tags"]}])[-1000:]
+                st["last_day"], st["last_source"] = today, draft["source"]
+                st.pop("draft", None)
+                state.save()
+                log.info("Статья %s: %s", draft["fragment"], draft["title"])
+                return 1
+        except Exception as e:
+            log.exception("Статьи: ошибка")
+            if preview or force:
+                state.save()
+                raise
+            await notify_owner(bot, "articles", f"Статьи: не получилось подготовить пост ({type(e).__name__}: {e}). "
+                                                "Попробую позже.")
+        state.save()
+        return 0
+
 # ─── Источники ──────────────────────────────────────────────────────────────
 # Новый источник = функция check_<имя>(bot) + строка здесь.
 
@@ -1662,6 +1793,8 @@ SOURCES = {
                    "every": AMERICA_INTERVAL},
     "lectures":   {"title": "Американистика: рассказы по лекциям Йеля, раз в день", "check": check_lectures,
                    "every": 1800},
+    "articles":   {"title": "Американистика: рассказы по статьям (Prologue, Библиотека Конгресса, JSTOR Daily), "
+                            "раз в день", "check": check_articles, "every": 1800},
 }
 
 
@@ -1732,6 +1865,7 @@ async def cmd_start(update, context):
         "/list - источники, каналы и чьи ленты Letterboxd читаю\n"
         "/check - проверить все источники сейчас (или /check kanoner)\n"
         "/check lectures - черновик поста по лекции мне в личку, /publish - выпустить его в канал\n"
+        "/check articles - черновик поста по статье, /publish articles - выпустить его\n"
         "/add ник, /remove ник - люди на Letterboxd"
     )
 
@@ -1805,7 +1939,7 @@ async def cmd_check(update, context):
         await update.message.reply_text(f"Проверяю {name}...")
         try:
             fn = SOURCES[name]["check"]
-            if name == "lectures":  # конспект сначала владельцу
+            if name in ("lectures", "articles"):  # длинные посты сначала владельцу
                 n = await fn(context.bot, force=True, preview=True)
                 lines.append(f"{name}: черновиков {n}")
                 continue
@@ -1819,16 +1953,20 @@ async def cmd_check(update, context):
 
 @owner_only
 async def cmd_publish(update, context):
-    """Черновик конспекта (или новый, если черновика нет) - в канал сейчас."""
-    if not state.channels("lectures"):
-        await update.message.reply_text("lectures не подключен к каналу")
+    """Черновик поста по лекции (/publish) или по статье (/publish articles) - в канал сейчас."""
+    name = (context.args[0].lower() if context.args else "lectures")
+    if name not in ("lectures", "articles"):
+        await update.message.reply_text("Можно: /publish или /publish articles")
+        return
+    if not state.channels(name):
+        await update.message.reply_text(f"{name} не подключен к каналу")
         return
     try:
-        n = await check_lectures(context.bot, force=True)
+        n = await (check_lectures if name == "lectures" else check_articles)(context.bot, force=True)
     except Exception as e:
         await update.message.reply_text(f"Не получилось: {type(e).__name__}: {str(e)[:300]}")
         return
-    await update.message.reply_text("Конспект опубликован." if n else "Публиковать нечего.")
+    await update.message.reply_text("Опубликовано." if n else "Публиковать нечего.")
 
 
 @owner_only
