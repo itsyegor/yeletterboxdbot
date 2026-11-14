@@ -32,7 +32,19 @@ SOURCES = {
         "name": "JSTOR Daily", "short": "JSTOR Daily", "tag": "JSTORDaily",
         "feed": "https://daily.jstor.org/feed/",
         "about": "научно-популярный журнал JSTOR: статьи историков и журналистов со ссылками на исследования",
-        "mixed": True,  # пишет не только об истории США - нерелевантное отсеивают заметки
+        "mixed": True,  # пишет и о других странах - такое отсеивают заметки
+    },
+    "heritage": {
+        "name": "American Heritage", "short": "American Heritage", "tag": "AmericanHeritage",
+        "kind": "sitemap", "sitemap": "https://www.americanheritage.com/sitemap.xml?page={n}", "sitemap_pages": 10,
+        "about": "журнал об истории США, выходит с 1949 года; пишут историки и журналисты",
+    },
+    "smithsonian": {
+        "name": "Smithsonian Magazine", "short": "Smithsonian", "tag": "Smithsonian",
+        "kind": "listing", "listing": "https://www.smithsonianmag.com/history/?page={n}",
+        "link_re": r'href="(/history/[a-z0-9-]+-\d{6,}/)"', "base": "https://www.smithsonianmag.com",
+        "about": "журнал Смитсоновского института, раздел истории",
+        "mixed": True,
     },
 }
 
@@ -83,8 +95,74 @@ def parse_feed(xml, source_id):
 
 
 def page_url(source_id, page):
-    base = SOURCES[source_id]["feed"]
+    src = SOURCES[source_id]
+    if src.get("kind") == "listing":
+        return src["listing"].format(n=page)
+    base = src["feed"]
     return base if page <= 1 else f"{base}?paged={page}"
+
+
+def sitemap_links(xml):
+    """Ссылки на статьи American Heritage из карты сайта (без разделов, выпусков и служебных страниц)."""
+    out = []
+    for loc in re.findall(r"<loc>(.*?)</loc>", xml or ""):
+        loc = loc.replace("://ftp.", "://www.")  # в карте сайта старый хост с чужим сертификатом
+        path = loc.split("://", 1)[-1].split("/", 1)[-1]
+        if (path and "/" not in path.strip("/")
+                and not re.match(r"(content|taxonomy|node|user|books|search|correspondence|letters|postscripts"
+                                 r"|the-editors|readers|in-this-issue)", path)):
+            out.append(loc)
+    return out
+
+
+def listing_links(source_id, page_html):
+    src = SOURCES[source_id]
+    return sorted({src["base"] + p for p in re.findall(src["link_re"], page_html or "")})
+
+
+def _meta_content(page, *names):
+    for n in names:
+        m = re.search(rf"""<meta[^>]+(?:name|property)=["']{re.escape(n)}["'][^>]+content=(["'])(.*?)\1""", page)
+        if m and m.group(2).strip():
+            return htmlmod.unescape(m.group(2)).strip()
+    return ""
+
+
+def parse_page(page, url, source_id):
+    """HTML страницы статьи -> item как из ленты. Текст - абзацы основного блока."""
+    # основной блок - тот из блоков body, где больше всего текста в абзацах (первый у AH - иконки соцсетей)
+    starts = [m.end() for m in re.finditer(r'class="[^"]*(?:field--name-body|articleContent|article-body)[^"]*"[^>]*>', page)]
+    chunks = [page[s:s + 300000] for s in starts] or [page]
+    chunk = max(chunks, key=lambda c: sum(len(p) for p in re.findall(r"(?s)<p[^>]*>(.*?)</p>", c[:150000])))
+    paras = [html_to_text(p) for p in re.findall(r"(?s)<p[^>]*>(.*?)</p>", chunk[:150000])]
+    keep = []
+    for p in paras:
+        if re.search(r"(?i)all rights reserved|privacy statement|cookie policy|terms of use", p):
+            break  # дальше подвал сайта
+        if len(p) > 60 and not re.match(r"(?i)(sign up|subscribe|get the latest|support (our|independent)|add as preferred source)", p):
+            keep.append(p)
+    paras = keep
+    year = None
+    m = (re.search(r'"datePublished"\s*:\s*"(\d{4})', page) or re.search(r"\b[A-Z][a-z]+ (1[89]\d\d|20[012]\d), Volume", page)
+         or re.search(r'article:published_time"[^>]+content="(\d{4})', page))
+    if m:
+        year = int(m.group(1))
+    author = _meta_content(page, "author", "article:author", "parsely-author")
+    if not author:  # American Heritage: «Authored by» в шапке статьи, первое после заголовка h1
+        h1 = page.find("<h1")
+        m = re.search(r"Authored by:\s*<a[^>]*>([^<]+)</a>", page[h1 if h1 > 0 else 0:])
+        author = htmlmod.unescape(m.group(1)).strip() if m else ""
+    if not author:
+        m = re.search(r'"author"\s*:\s*(?:\[\s*)?\{[^}]*"name"\s*:\s*"([^"]+)"', page)
+        author = m.group(1) if m else ""
+    title = _meta_content(page, "og:title")
+    if not title:
+        m = re.search(r"(?s)<title>(.*?)</title>", page)
+        title = htmlmod.unescape(m.group(1)).split(" | ")[0].strip() if m else ""
+    if author == "The Editors":
+        author = "редакция"
+    return {"source": source_id, "url": url, "title": title, "author": author,
+            "year": year, "categories": [], "text": "\n\n".join(paras)}
 
 
 def pick_source(last_source=None):
@@ -104,7 +182,7 @@ NOTES_PROMPT = """Ты готовишь заметки для поста в те
 
 Статья: «{title}», автор {author}, {source} ({about}), {year}.
 
-Сначала реши, подходит ли статья. Канал - об истории США (и Северной Америки) любой эпохи, от колоний до 2014 года включительно; события позже 2014 года не берем. Если статья не об истории США, если она о событиях после 2014 года, если это объявление, обзор выставки или новость о самом учреждении без исторического содержания - ответь skip: true.
+Сначала реши, подходит ли статья. Канал - о прошлом США и Северной Америки, до 2014 года включительно, на любую тему: политика, война, быт, экономика, культура, мода, наука, преступления, курьезы - все годится. Ответь skip: true только в трех случаях: статья о другой стране, а не о США и Северной Америке; статья о событиях после 2014 года; в статье нет рассказа о прошлом вообще (объявление о часах работы, призыв к пожертвованиям и т. п.).
 
 Если подходит, разберись и запиши:
 - point: какую мысль или историю статья рассказывает;
@@ -113,7 +191,7 @@ NOTES_PROMPT = """Ты готовишь заметки для поста в те
 - story: факты и события в том порядке, в каком их удобно рассказывать, у каждого - чем он работает на мысль. То, что на мысль не работает, не записывай;
 - lecturer_views: что в статье - именно трактовка автора, а не общеизвестный факт;
 - quote: место, где лучше всего видна суть: живой документ, свидетельство, яркий кусок рассказа или объяснение автора. 1-4 куска статьи по порядку, вместе 200-450 слов. Для каждого куска start и end - первые и последние 6-10 слов, скопированные из текста дословно;
-- images: 2-3 поисковых запроса по-английски для Wikimedia Commons. Запрос - по предмету (событие, человек, место, документ, вещь), а не по виду картинки. Короткий и конкретный;
+- images: 3-5 поисковых запросов по-английски для поиска иллюстрации (Wikimedia Commons, Библиотека Конгресса), от конкретного к общему: сначала сам предмет (событие, человек, место, документ, вещь), последний - эпоха и место («Philadelphia 1770s», «Kansas cattle town 1870s»), чтобы картинка нашлась всегда. Запрос - по предмету, а не по виду картинки;
 - tags: 2-4 тега из списков, только прямо следующие из статьи. Эпохи: {era}. Темы: {theme}.
 Пиши по-русски, коротко, как для себя. Только то, что есть в статье.
 
@@ -218,7 +296,7 @@ def build_post(post, item, quote_ru=None, image=None, limit=4000):
             credit = lectures.image_credit(image)
             lines += ["", f"🖼 <i>{esc(clean(image['caption']))}</i>"
                           + (f" ({esc(credit)})" if credit else "")
-                          + (f' · <a href="{esc(image["page"])}">Wikimedia Commons</a>' if image.get("page") else "")]
+                          + (f' · <a href="{esc(image["page"])}">{esc(image.get("site", "Wikimedia Commons"))}</a>' if image.get("page") else "")]
         lines += ["", tags]
         return "\n".join(lines)
 

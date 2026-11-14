@@ -1566,26 +1566,35 @@ async def lecture_draft(bot, client, st):
 
 
 async def lecture_image(client, queries, post_text):
-    """Иллюстрация с Wikimedia Commons: поиск по запросам из заметок, выбор и подпись - Claude.
+    """Иллюстрация к посту: поиск на Wikimedia Commons и в Библиотеке Конгресса, выбор и подпись - Claude.
 
-    -> кандидат с полем caption или None. Ошибка поиска не мешает посту выйти без картинки.
+    Запросы идут от конкретного к общему, так что что-нибудь находится почти всегда.
+    -> кандидат с полем caption или None. Ошибка поиска не мешает посту выйти.
     """
     seen, cands = set(), []
-    for q in (queries or [])[:3]:
+
+    async def search(url, params, parse, headers):
         try:
-            r = await client.get(lectures.COMMONS_API, params=lectures.commons_params(str(q)),
-                                 headers={"User-Agent": lectures.COMMONS_UA}, timeout=30)
+            r = await client.get(url, params=params, headers=headers, timeout=30, follow_redirects=True)
             r.raise_for_status()
-            for c in lectures.commons_candidates(r.json()):
-                if c["title"] not in seen:
-                    seen.add(c["title"])
+            for c in parse(r.json()):
+                if c["thumb"] not in seen:
+                    seen.add(c["thumb"])
                     cands.append(c)
         except Exception as e:
-            log.info("Commons: поиск %r не удался (%s)", q, e)
+            log.info("Картинки: %s %r не удалось (%s)", url, params.get("gsrsearch") or params.get("q"), e)
+
+    for q in (queries or [])[:5]:
+        await search(lectures.COMMONS_API, lectures.commons_params(str(q)), lectures.commons_candidates,
+                     {"User-Agent": lectures.COMMONS_UA})
+        # Библиотека Конгресса ищет хуже с годами в запросе («Dodge City 1870s» - пусто, «Dodge City» - 8)
+        await search(lectures.LOC_API, lectures.loc_params(re.sub(r"\b\d{3,4}s?\b", "", str(q)).strip()),
+                     lectures.loc_candidates,
+                     {"User-Agent": lectures.COMMONS_UA})
     if not cands:
-        log.info("Commons: картинок не нашлось по %r", queries)
+        log.info("Картинки: ничего не нашлось по %r", queries)
         return None
-    cands = sorted(cands, key=lambda c: -c.get("usage", 0))[:12]
+    cands = sorted(cands, key=lambda c: -c.get("usage", 0))[:16]
     ans = await claude_json(lectures.pick_prompt(post_text, cands), LECTURES_MODEL, lectures.PICK_SCHEMA,
                             max_tokens=800)
     try:
@@ -1593,7 +1602,7 @@ async def lecture_image(client, queries, post_text):
     except (TypeError, ValueError):
         i = -1
     if not 0 <= i < len(cands) or not (ans or {}).get("caption"):
-        log.info("Commons: подходящей картинки нет")
+        log.info("Картинки: ни одна не подошла")
         return None
     return dict(cands[i], caption=ans["caption"])
 
@@ -1674,6 +1683,8 @@ async def feed_pages(client, st, sid):
 
     async def exists(p):
         r = await client.get(articles.page_url(sid, p), headers=HEADERS, timeout=30, follow_redirects=True)
+        if articles.SOURCES[sid].get("kind") == "listing":
+            return r.status_code == 200 and bool(articles.listing_links(sid, r.text))
         return r.status_code == 200 and "<item>" in r.text
 
     lo, hi = 1, 16
@@ -1690,16 +1701,43 @@ async def feed_pages(client, st, sid):
     return lo
 
 
+async def article_candidate(client, st, sid, used):
+    """Случайная неиспользованная статья источника sid (лента, карта сайта или страница раздела)."""
+    src = articles.SOURCES[sid]
+    kind = src.get("kind", "feed")
+    if kind == "feed":
+        pages = await feed_pages(client, st, sid)
+        r = await client.get(articles.page_url(sid, random.randint(1, pages)), headers=HEADERS,
+                             timeout=30, follow_redirects=True)
+        return articles.choose_item(articles.parse_feed(r.text, sid), used)
+    if kind == "sitemap":
+        r = await client.get(src["sitemap"].format(n=random.randint(1, src["sitemap_pages"])), headers=HEADERS,
+                             timeout=60, follow_redirects=True)
+        links = articles.sitemap_links(r.text)
+    else:
+        pages = await feed_pages(client, st, sid)
+        r = await client.get(articles.page_url(sid, random.randint(1, pages)), headers=HEADERS,
+                             timeout=30, follow_redirects=True)
+        links = articles.listing_links(sid, r.text)
+    random.shuffle(links)
+    for url in [u for u in links if u not in used][:4]:
+        p = await client.get(url, headers=HEADERS, timeout=30, follow_redirects=True)
+        if p.status_code != 200:
+            continue
+        item = articles.parse_page(p.text, url, sid)
+        if len(item["text"]) >= articles.MIN_TEXT and item["title"]:
+            return item
+        used.add(url)
+    return None
+
+
 async def article_draft(client, st):
     """Пост по случайной статье из архивов. -> черновик или None."""
     used = set(st["used"])
     if st.get("draft"):
         used.add(st["draft"]["fragment"])
     for sid in articles.pick_source(st.get("last_source")) * 2:
-        pages = await feed_pages(client, st, sid)
-        r = await client.get(articles.page_url(sid, random.randint(1, pages)), headers=HEADERS,
-                             timeout=30, follow_redirects=True)
-        item = articles.choose_item(articles.parse_feed(r.text, sid), used)
+        item = await article_candidate(client, st, sid, used)
         if not item:
             continue
         notes = lectures.parse_answer(await claude_json(articles.notes_prompt(item), LECTURES_MODEL,
@@ -1793,8 +1831,8 @@ SOURCES = {
                    "every": AMERICA_INTERVAL},
     "lectures":   {"title": "Американистика: рассказы по лекциям Йеля, раз в день", "check": check_lectures,
                    "every": 1800},
-    "articles":   {"title": "Американистика: рассказы по статьям (Prologue, Библиотека Конгресса, JSTOR Daily), "
-                            "раз в день", "check": check_articles, "every": 1800},
+    "articles":   {"title": "Американистика: рассказы по статьям (Prologue, Библиотека Конгресса, JSTOR Daily, "
+                            "American Heritage, Smithsonian), раз в день", "check": check_articles, "every": 1800},
 }
 
 
