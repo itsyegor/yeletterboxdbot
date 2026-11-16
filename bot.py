@@ -2176,9 +2176,21 @@ _pictures_lock = asyncio.Lock()
 
 
 async def picture_draft(client, st):
+    """Черновик картинки; если по одной теме ничего не нашлось, пробует еще две другие."""
+    tried = []
+    for _ in range(3):
+        draft = await picture_draft_once(client, st, tried)
+        if draft:
+            return draft
+    log.info("Картинка дня: ничего не нашлось по темам %s", tried)
+    return None
+
+
+async def picture_draft_once(client, st, tried):
     used = set(st["used"])
-    # эпоха и тема, которых не было за неделю ни в одной рубрике
-    era, theme = pictures.pick_theme([t for r in recent_topics() for t in r[2]])
+    # эпоха и тема, которых не было за неделю ни в одной рубрике и еще не пробовались сейчас
+    era, theme = pictures.pick_theme([t for r in recent_topics() for t in r[2]] + [t for p in tried for t in p])
+    tried.append((era, theme))
     ideas = await claude_json(pictures.ideas_prompt(era, theme, [p["title"] for p in st["posted"]]),
                               LECTURES_MODEL, pictures.IDEAS_SCHEMA, max_tokens=600)
     cands, seen = [], set()
@@ -2846,11 +2858,16 @@ async def make_draft(bot, rubric, chat_id):
     try:
         await show(bot, *screen_rubric(chat_id, rubric))
         n = await DRAFT_FN[rubric]()(bot, force=True, preview=True)
-        if not n:
-            ui()["last_check"][rubric] = "Черновик не получился: подходящего материала не нашлось."
+        hm = local_now().strftime("%H:%M")
+        if n:
+            ui()["last_check"].pop(rubric, None)
+        else:
+            ui()["last_check"][rubric] = (f"{hm}: черновик не получился, подходящей картинки не нашлось. Попробуй еще раз."
+                                          if rubric == "pictures" else
+                                          f"{hm}: черновик не получился, подходящего материала не нашлось.")
     except Exception as e:
         log.exception("Черновик %s", rubric)
-        ui()["last_check"][rubric] = f"Черновик не получился: {type(e).__name__}: {str(e)[:200]}"
+        ui()["last_check"][rubric] = f"{local_now().strftime('%H:%M')}: черновик не получился: {type(e).__name__}: {str(e)[:200]}"
     finally:
         busy.pop(rubric, None)
         state.save()
@@ -2949,6 +2966,8 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 await notify_owner(bot, f"pub-{dkind}-{time.time()}", f"Не опубликовал: {type(e).__name__}: {e}")
                 return
+            if n:
+                ui()["last_check"].pop(rubric, None)
             if n and rubric == "longreads":  # ручная публикация занимает ближайший слот расписания
                 lr = state.data.setdefault("longreads", {})
                 today = local_now().date().isoformat()
