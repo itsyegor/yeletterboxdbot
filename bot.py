@@ -1792,11 +1792,16 @@ async def article_candidate(client, st, sid, used):
         pages = await feed_pages(client, st, sid)
         r = await client.get(articles.page_url(sid, random.randint(1, pages)), headers=HEADERS,
                              timeout=30, follow_redirects=True)
-        return articles.choose_item(articles.parse_feed(r.text, sid), used)
-    if kind == "sitemap":
-        r = await client.get(src["sitemap"].format(n=random.randint(1, src["sitemap_pages"])), headers=HEADERS,
-                             timeout=60, follow_redirects=True)
-        links = articles.sitemap_links(r.text)
+        item = articles.choose_item(articles.parse_feed(r.text, sid), used)
+        return articles.window(item, used) if item else None
+    if kind == "npr":  # лента подкаста со всеми выпусками -> расшифровка случайного выпуска
+        r = await client.get(src["feed"], headers=HEADERS, timeout=60, follow_redirects=True)
+        links = [articles.npr_transcript_url(l) for l in re.findall(r"<item>.*?<link>(.*?)</link>", r.text, re.S)]
+        links = [l for l in links if l]
+    elif kind == "sitemap":
+        maps = src.get("sitemaps") or [src["sitemap"].format(n=random.randint(1, src["sitemap_pages"]))]
+        r = await client.get(random.choice(maps), headers=HEADERS, timeout=60, follow_redirects=True)
+        links = articles.sitemap_links(r.text, sid)
     else:
         pages = await feed_pages(client, st, sid)
         r = await client.get(articles.page_url(sid, random.randint(1, pages)), headers=HEADERS,
@@ -1804,12 +1809,14 @@ async def article_candidate(client, st, sid, used):
         links = articles.listing_links(sid, r.text)
     random.shuffle(links)
     for url in [u for u in links if u not in used][:4]:
-        p = await client.get(url, headers=HEADERS, timeout=30, follow_redirects=True)
+        p = await client.get(url, headers=HEADERS, timeout=40, follow_redirects=True)
         if p.status_code != 200:
             continue
         item = articles.parse_page(p.text, url, sid)
         if len(item["text"]) >= articles.MIN_TEXT and item["title"]:
-            return item
+            item = articles.window(item, used)  # интервью и подкасты длинные - берется кусок
+            if item:
+                return item
         used.add(url)
     return None
 
@@ -1827,17 +1834,17 @@ async def article_draft(client, st):
         notes = lectures.parse_answer(await claude_json(articles.notes_prompt(item), LECTURES_MODEL,
                                                         lectures.NOTES_SCHEMA, max_tokens=6000))
         if notes is None or notes.get("skip"):  # не о США, после 2014 года или без рассказа о прошлом
-            log.info("Статьи: пропускаю %s", item["url"])
-            st["used"].append(item["url"])
-            used.add(item["url"])
+            log.info("Статьи: пропускаю %s", item["fragment"])
+            st["used"].append(item["fragment"])
+            used.add(item["fragment"])
             state.save()
             continue
         why = topic_problem(notes.get("tags"))
         if why and deferred_n < TOPIC_RETRIES:  # не в used: статья может выйти позже
-            log.info("Статьи: откладываю %s (%s)", item["url"], why)
+            log.info("Статьи: откладываю %s (%s)", item["fragment"], why)
             fallback = fallback or (item, notes)
             deferred_n += 1
-            used.add(item["url"])
+            used.add(item["fragment"])
             continue
         return await article_write(client, item, notes)
     if fallback:
@@ -1849,7 +1856,7 @@ async def article_write(client, item, notes):
     quote_ru = None
     passages = lectures.extract_quotes(item["text"], notes.get("quote"))
     if passages:
-        quote_ru = (await claude_text(articles.translate_prompt(passages), LECTURES_MODEL,
+        quote_ru = (await claude_text(articles.translate_prompt(passages, item), LECTURES_MODEL,
                                       max_tokens=5000)).strip() or None
     raw = await claude_text(articles.post_prompt(item, notes, quote_ru), LECTURES_MODEL, max_tokens=5000)
     edited = await claude_text(lectures.edit_prompt(raw, item["text"], quote_ru), LECTURES_MODEL,
@@ -1860,7 +1867,7 @@ async def article_write(client, item, notes):
     post["tags"] = notes.get("tags")
     image = await lecture_image(client, notes.get("images"),
                                 "\n\n".join([post["title"], post["before"], post["after"]]))
-    return {"fragment": item["url"], "source": item["source"], "title": post["title"],
+    return {"fragment": item.get("fragment", item["url"]), "source": item["source"], "title": post["title"],
             "tags": articles.post_tags(post, item),
             "text": articles.build_post(post, item, quote_ru, image),
             "preview": image["thumb"] if image else None}
@@ -2056,8 +2063,8 @@ SOURCES = {
                    "every": AMERICA_INTERVAL},
     "lectures":   {"title": "Американистика: рассказы по лекциям Йеля", "check": check_lectures,
                    "every": 1800},
-    "articles":   {"title": "Американистика: рассказы по статьям (Prologue, Библиотека Конгресса, JSTOR Daily, "
-                            "American Heritage, Smithsonian)", "check": check_articles, "every": 1800},
+    "articles":   {"title": "Американистика: статьи, интервью Miller Center и подкаст Throughline (Prologue, Библиотека Конгресса, JSTOR Daily, "
+                            "American Heritage, Smithsonian, энциклопедии Арканзаса и Алабамы)", "check": check_articles, "every": 1800},
     "pictures":   {"title": "Американистика: картинка с коротким текстом, по будням", "check": check_pictures,
                    "every": 1800},
 }

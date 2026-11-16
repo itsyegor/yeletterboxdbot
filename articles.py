@@ -46,7 +46,40 @@ SOURCES = {
         "about": "журнал Смитсоновского института, раздел истории",
         "mixed": True,
     },
+    "miller": {
+        "name": "Miller Center, устная история президентств", "short": "Miller Center", "tag": "MillerCenter",
+        "kind": "sitemap", "sitemaps": ["https://millercenter.org/sitemap.xml"],
+        "link_re": r"/the-presidency/presidential-oral-histories/[a-z0-9-]+-oral-history[a-z0-9-]*$",
+        "host_fix": ("uvamiller.prod.acquia-sites.com", "millercenter.org"),
+        "about": "интервью с сотрудниками администраций от Форда до Обамы, записанные Miller Center "
+                 "Виргинского университета",
+        "rubric": "интервью", "spoken": True, "kind_ru": "интервью",
+    },
+    "throughline": {
+        "name": "Throughline, NPR", "short": "Throughline", "tag": "Throughline",
+        "kind": "npr", "feed": "https://feeds.npr.org/510333/podcast.xml",
+        "about": "исторический подкаст NPR: как прошлое объясняет сегодняшние события",
+        "rubric": "подкасты", "spoken": True, "kind_ru": "выпуск подкаста", "mixed": True,
+    },
+    "arkansas": {
+        "name": "Encyclopedia of Arkansas", "short": "Encyclopedia of Arkansas", "tag": "Арканзас",
+        "kind": "sitemap", "sitemaps": [f"https://encyclopediaofarkansas.net/eoa-entry-sitemap{n}.xml"
+                                        for n in ["", 2, 3, 4, 5, 6, 7, 8, 9]],
+        "link_re": r"/entries/[a-z0-9-]+/?$", "body": "eoa-entry-main",
+        "about": "энциклопедия штата Арканзас: тысячи статей о городах, людях, событиях и местных историях",
+        "kind_ru": "статья энциклопедии", "no_year": True,  # год - дата статьи, а не событий: в шапке не нужен
+    },
+    "alabama": {
+        "name": "Encyclopedia of Alabama", "short": "Encyclopedia of Alabama", "tag": "Алабама",
+        "kind": "sitemap", "sitemaps": [f"https://encyclopediaofalabama.org/article-sitemap{n}.xml" for n in ["", 2, 3]],
+        "link_re": r"/article/[a-z0-9-]+/?$", "body": "entry-content",
+        "about": "энциклопедия штата Алабама: статьи о людях, местах и событиях штата",
+        "kind_ru": "статья энциклопедии", "no_year": True,  # год - дата статьи, а не событий: в шапке не нужен
+    },
 }
+
+LONG_TEXT = 40000   # длиннее (интервью Miller Center - до 200 тысяч знаков) - берется случайный кусок
+WINDOW = 30000
 
 MIN_TEXT = 2500  # короче - это заметка, а не статья
 
@@ -102,8 +135,18 @@ def page_url(source_id, page):
     return base if page <= 1 else f"{base}?paged={page}"
 
 
-def sitemap_links(xml):
-    """Ссылки на статьи American Heritage из карты сайта (без разделов, выпусков и служебных страниц)."""
+def sitemap_links(xml, source_id="heritage"):
+    """Ссылки на статьи из карты сайта. У источников с link_re - по этому шаблону пути,
+    у American Heritage - все одноуровневые пути, кроме разделов, выпусков и писем в редакцию."""
+    src = SOURCES[source_id]
+    if src.get("link_re"):
+        out = []
+        for loc in re.findall(r"<loc>(.*?)</loc>", xml or ""):
+            if src.get("host_fix"):
+                loc = loc.replace(*src["host_fix"]).replace("http://", "https://")
+            if re.search(src["link_re"], loc):
+                out.append(loc)
+        return sorted(set(out))
     out = []
     for loc in re.findall(r"<loc>(.*?)</loc>", xml or ""):
         loc = loc.replace("://ftp.", "://www.")  # в карте сайта старый хост с чужим сертификатом
@@ -120,6 +163,42 @@ def listing_links(source_id, page_html):
     return sorted({src["base"] + p for p in re.findall(src["link_re"], page_html or "")})
 
 
+def parse_npr_transcript(page, url, source_id):
+    """Расшифровка NPR: абзацы идут незакрытыми <p> внутри блока transcript."""
+    i = page.find("transcript storytext")
+    chunk = page[i:i + 300000] if i >= 0 else ""
+    end = re.search(r'(?i)copyright ©|class="[^"]*disclaimer|</article>', chunk)
+    chunk = chunk[: end.start()] if end else chunk
+    paras = [html_to_text(p) for p in re.split(r"(?i)<p[^>]*>", chunk)]
+    paras = [p for p in paras if len(p) > 1 and not p.startswith(("Transcript", "transcript storytext"))]
+    title = _meta_content(page, "og:title").split(" : ")[0]
+    m = re.search(r'"datePublished"\s*:\s*"(\d{4})', page) or re.search(r"/(20\d\d)/\d\d/\d\d/", url)
+    return {"source": source_id, "url": url, "title": title, "author": "", "year": int(m.group(1)) if m else None,
+            "categories": [], "text": "\n\n".join(paras)}
+
+
+def npr_transcript_url(link):
+    """Ссылка на выпуск -> ссылка на его расшифровку (id - сегмент после даты)."""
+    m = re.search(r"npr\.org/\d{4}/\d\d/\d\d/([^/]+)/", link) or re.search(r"npr\.org/(?:transcripts/)?(\d{6,})", link)
+    return f"https://www.npr.org/transcripts/{m.group(1)}" if m else None
+
+
+def window(item, used):
+    """Длинный текст - случайный неиспользованный кусок около WINDOW знаков по границе абзацев.
+    -> (item с куском и fragment, или None, если все куски уже были)."""
+    text = item["text"]
+    if len(text) <= LONG_TEXT:
+        return dict(item, fragment=item["url"])
+    n = max(1, len(text) // WINDOW)
+    free = [k for k in range(n) if f"{item['url']}#w{k}" not in used]
+    if not free:
+        return None
+    k = random.choice(free)
+    start = text.rfind("\n\n", 0, k * WINDOW) + 2 if k else 0
+    end = text.find("\n\n", start + WINDOW)
+    return dict(item, text=text[start: end if end > 0 else None], fragment=f"{item['url']}#w{k}", excerpt=True)
+
+
 def _meta_content(page, *names):
     for n in names:
         m = re.search(rf"""<meta[^>]+(?:name|property)=["']{re.escape(n)}["'][^>]+content=(["'])(.*?)\1""", page)
@@ -130,13 +209,22 @@ def _meta_content(page, *names):
 
 def parse_page(page, url, source_id):
     """HTML страницы статьи -> item как из ленты. Текст - абзацы основного блока."""
+    src = SOURCES.get(source_id, {})
+    if src.get("kind") == "npr":
+        return parse_npr_transcript(page, url, source_id)
     # основной блок - тот из блоков body, где больше всего текста в абзацах (первый у AH - иконки соцсетей)
-    starts = [m.end() for m in re.finditer(r'class="[^"]*(?:field--name-body|articleContent|article-body)[^"]*"[^>]*>', page)]
-    chunks = [page[s:s + 300000] for s in starts] or [page]
+    body_re = re.escape(src["body"]) if src.get("body") else r"field--name-body|articleContent|article-body"
+    starts = [m.end() for m in re.finditer(rf'class="[^"]*(?:{body_re})[^"]*"[^>]*>', page)]
+    chunks = [page[s:s + 400000] for s in starts] or [page]
     chunk = max(chunks, key=lambda c: sum(len(p) for p in re.findall(r"(?s)<p[^>]*>(.*?)</p>", c[:150000])))
-    paras = [html_to_text(p) for p in re.findall(r"(?s)<p[^>]*>(.*?)</p>", chunk[:150000])]
+    for stop in ("article-further", "article-authors", "eoa-entry-sidebar", "related-articles"):
+        if stop in chunk:
+            chunk = chunk[:chunk.index(stop)]
+    paras = [html_to_text(p) for p in re.findall(r"(?s)<p[^>]*>(.*?)</p>", chunk[:400000])]
     keep = []
     for p in paras:
+        if re.match(r"(?i)(for additional information|additional resources|further reading|selected bibliography)", p):
+            break  # дальше список литературы
         if re.search(r"(?i)all rights reserved|privacy statement|cookie policy|terms of use", p):
             break  # дальше подвал сайта
         if len(p) > 60 and not re.match(r"(?i)(sign up|subscribe|get the latest|support (our|independent)|add as preferred source)", p):
@@ -159,6 +247,12 @@ def parse_page(page, url, source_id):
     if not title:
         m = re.search(r"(?s)<title>(.*?)</title>", page)
         title = htmlmod.unescape(m.group(1)).split(" | ")[0].strip() if m else ""
+    title = re.split(r" \| | - Encyclopedia of ", title)[0].strip()
+    if source_id == "miller":  # автор - сам Miller Center, год - дата интервью
+        author = ""
+        m = re.search(r"(?:January|February|March|April|May|June|July|August|September|October|November|December)"
+                      r" \d{1,2}, ((?:19|20)\d\d)", page)
+        year = int(m.group(1)) if m else year
     if author == "The Editors":
         author = "редакция"
     return {"source": source_id, "url": url, "title": title, "author": author,
@@ -180,7 +274,7 @@ def choose_item(items, used):
 
 NOTES_PROMPT = """Ты готовишь заметки для поста в телеграм-канале об истории США по статье. Сам пост будет писаться потом по этим заметкам, поэтому здесь важна не форма, а понимание.
 
-Статья: «{title}», автор {author}, {source} ({about}), {year}.
+Материал: {kind} «{title}», автор {author}, {source} ({about}), {year}. Ниже он везде называется статьей.
 
 Сначала реши, подходит ли статья. Канал - о прошлом США и Северной Америки, до 2014 года включительно, на любую тему: политика, война, быт, экономика, культура, мода, наука, преступления, курьезы - все годится. Ответь skip: true только в трех случаях: статья о другой стране, а не о США и Северной Америке; статья о событиях после 2014 года; в статье нет рассказа о прошлом вообще (объявление о часах работы, призыв к пожертвованиям и т. п.).
 
@@ -244,8 +338,11 @@ TRANSLATE_PROMPT = """Ниже несколько кусков статьи об
 
 def _meta(item):
     src = SOURCES[item["source"]]
+    kind = src.get("kind_ru", "статья")
+    if item.get("excerpt"):
+        kind += " (дан кусок, а не весь текст: пиши только о нем)"
     return dict(title=item["title"], author=item["author"] or "автор не указан", source=src["name"],
-                about=src["about"], year=item["year"] or "год не указан")
+                about=src["about"], year=item["year"] or "год не указан", kind=kind)
 
 
 def notes_prompt(item):
@@ -260,13 +357,19 @@ def post_prompt(item, notes, quote_ru=None):
                               quote_block=lectures.quote_block(quote_ru))
 
 
-def translate_prompt(passages):
-    return TRANSLATE_PROMPT.format(text="\n\n---\n\n".join(passages))
+SPOKEN_RULE = """- Это расшифровка устной речи: убери слова-паразиты, повторы, оговорки и ремарки вроде (LAUGHTER), (SOUNDBITE OF MUSIC); реплики разных людей начинай с имени говорящего, как в печатном интервью."""
+
+
+def translate_prompt(passages, item=None):
+    text = TRANSLATE_PROMPT.format(text="\n\n---\n\n".join(passages))
+    if item and SOURCES[item["source"]].get("spoken"):
+        text = text.replace("- Букву «ё» не используй.", SPOKEN_RULE + "\n- Букву «ё» не используй.")
+    return text
 
 
 def post_tags(post, item):
-    """Ровно три тега: рубрика и две самые точные темы (журнал и так виден в шапке)."""
-    return ["статьи"] + america.clean_tags(post.get("tags"))[:2]
+    """Ровно три тега: рубрика и две самые точные темы (источник и так виден в шапке)."""
+    return [SOURCES[item["source"]].get("rubric", "статьи")] + america.clean_tags(post.get("tags"))[:2]
 
 
 def build_post(post, item, quote_ru=None, image=None, limit=4000):
@@ -283,7 +386,8 @@ def build_post(post, item, quote_ru=None, image=None, limit=4000):
     src = SOURCES[item["source"]]
     # английское название статьи - это и есть ссылка на оригинал
     byline = " · ".join(x for x in [f'<a href="{esc(item["url"])}">{esc(item["title"])}</a>', esc(item["author"]),
-                                    esc(src["short"]), str(item["year"]) if item["year"] else ""] if x)
+                                    esc(src["short"]),
+                                    str(item["year"]) if item["year"] and not src.get("no_year") else ""] if x)
     head = [f"<b>{esc(america._cut(clean(post['title']), 200))}</b>", f"<i>{byline}</i>", ""]
     tags = " ".join("#" + t for t in post_tags(post, item))
 
