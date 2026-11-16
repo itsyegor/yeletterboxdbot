@@ -61,6 +61,16 @@ SOURCES = {
         "about": "исторический подкаст NPR: как прошлое объясняет сегодняшние события",
         "rubric": "подкасты", "spoken": True, "kind_ru": "выпуск подкаста", "mixed": True,
     },
+    "adst": {
+        "name": "ADST, устная история американской дипломатии", "short": "ADST", "tag": "ADST",
+        "kind": "pdf_list", "listing": "https://adst.org/oral-history/oral-history-interviews/",
+        "link_re": r'href="(https://adst\.org/OH%20TOCs/[^"]+\.pdf)"',
+        "about": "интервью американских дипломатов о своей службе, записанные Ассоциацией дипломатических "
+                 "исследований (ADST)",
+        "rubric": "интервью", "spoken": True, "kind_ru": "интервью",
+        "scope": "Работа американских дипломатов за границей, отношения США с другими странами и жизнь "
+                 "американцев в посольствах - это тоже история США, такие куски не пропускай.",
+    },
     "arkansas": {
         "name": "Encyclopedia of Arkansas", "short": "Encyclopedia of Arkansas", "tag": "Арканзас",
         "kind": "sitemap", "sitemaps": [f"https://encyclopediaofarkansas.net/eoa-entry-sitemap{n}.xml"
@@ -183,6 +193,33 @@ def npr_transcript_url(link):
     return f"https://www.npr.org/transcripts/{m.group(1)}" if m else None
 
 
+def adst_title(pdf_url):
+    """«Bliss, Don Carroll Jr.toc.pdf» -> «Don Carroll Bliss Jr. Oral History»."""
+    from urllib.parse import unquote
+    name = unquote(pdf_url.rsplit("/", 1)[-1])
+    name = re.sub(r"(\.toc)?\.pdf$", "", name, flags=re.I).replace(".", " ").strip()
+    if "," in name:
+        last, first = [x.strip() for x in name.split(",", 1)]
+        name = f"{first} {last}"
+    return re.sub(r"\s+", " ", name) + " Oral History"
+
+
+def parse_adst_text(raw, url, source_id):
+    """Текст PDF интервью ADST: без оглавления, строки PDF склеены в абзацы, вопросы и ответы раздельно."""
+    m = re.search(r"\bQ:", raw)
+    head, body = (raw[: m.start()], raw[m.start():]) if m else ("", raw)
+    year = None
+    d = re.search(r"(?i)interview date:?\s*([A-Za-z]+ \d{1,2},? )?((?:19|20)\d\d)", head + body[:3000])
+    if d:
+        year = int(d.group(2))
+    body = re.sub(r"\n\s*\d+\s*\n", "\n", body)                      # номера страниц
+    body = re.sub(r"[ \t]*\n[ \t]*", " ", body)                        # строки PDF -> один поток
+    body = re.sub(r"\s+(Q:|[A-Z][A-Z .'-]{2,30}:)\s", r"\n\n\1 ", body)   # новый абзац на каждой реплике
+    body = re.sub(r"[ ]{2,}", " ", body).strip()
+    return {"source": source_id, "url": url, "title": adst_title(url), "author": "", "year": year,
+            "categories": [], "text": body}
+
+
 def window(item, used):
     """Длинный текст - случайный неиспользованный кусок около WINDOW знаков по границе абзацев.
     -> (item с куском и fragment, или None, если все куски уже были)."""
@@ -276,7 +313,7 @@ NOTES_PROMPT = """Ты готовишь заметки для поста в те
 
 Материал: {kind} «{title}», автор {author}, {source} ({about}), {year}. Ниже он везде называется статьей.
 
-Сначала реши, подходит ли статья. Канал - о прошлом США и Северной Америки, до 2014 года включительно, на любую тему: политика, война, быт, экономика, культура, мода, наука, преступления, курьезы - все годится. Ответь skip: true только в трех случаях: статья о другой стране, а не о США и Северной Америке; статья о событиях после 2014 года; в статье нет рассказа о прошлом вообще (объявление о часах работы, призыв к пожертвованиям и т. п.).
+Сначала реши, подходит ли статья. Канал - о прошлом США и Северной Америки, до 2014 года включительно, на любую тему: политика, война, быт, экономика, культура, мода, наука, преступления, курьезы - все годится. Ответь skip: true только в трех случаях: статья о другой стране, а не о США и Северной Америке; статья о событиях после 2014 года; в статье нет рассказа о прошлом вообще (объявление о часах работы, призыв к пожертвованиям и т. п.). {scope}
 
 Если подходит, разберись и запиши:
 - point: какую мысль или историю статья рассказывает;
@@ -342,7 +379,7 @@ def _meta(item):
     if item.get("excerpt"):
         kind += " (дан кусок, а не весь текст: пиши только о нем)"
     return dict(title=item["title"], author=item["author"] or "автор не указан", source=src["name"],
-                about=src["about"], year=item["year"] or "год не указан", kind=kind)
+                about=src["about"], year=item["year"] or "год не указан", kind=kind, scope=src.get("scope", ""))
 
 
 def notes_prompt(item):

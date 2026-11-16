@@ -3,3 +3,4 @@ httpx==0.28.1
 beautifulsoup4==4.15.0
 anthropic==2.3.0
 twifork==2.4.0
+pypdf==5.4.0

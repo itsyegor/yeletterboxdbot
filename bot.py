@@ -1794,6 +1794,28 @@ async def article_candidate(client, st, sid, used):
                              timeout=30, follow_redirects=True)
         item = articles.choose_item(articles.parse_feed(r.text, sid), used)
         return articles.window(item, used) if item else None
+    if kind == "pdf_list":  # ADST: страница со ссылками на PDF расшифровок
+        r = await client.get(src["listing"], headers=HEADERS, timeout=60, follow_redirects=True)
+        links = sorted(set(re.findall(src["link_re"], r.text)))
+        random.shuffle(links)
+        for url in links[:3]:
+            p = await client.get(url, headers=HEADERS, timeout=90, follow_redirects=True)
+            if p.status_code != 200 or not p.content.startswith(b"%PDF"):
+                continue
+            try:
+                import io
+                from pypdf import PdfReader
+                pages = PdfReader(io.BytesIO(p.content)).pages
+                raw = "\n".join((pg.extract_text() or "") for pg in pages[:400])
+            except Exception as e:
+                log.info("ADST: PDF %s не прочитался (%s)", url, e)
+                continue
+            item = articles.parse_adst_text(raw, url, sid)
+            if len(item["text"]) >= articles.MIN_TEXT:
+                item = articles.window(item, used)
+                if item:
+                    return item
+        return None
     if kind == "npr":  # лента подкаста со всеми выпусками -> расшифровка случайного выпуска
         r = await client.get(src["feed"], headers=HEADERS, timeout=60, follow_redirects=True)
         links = [articles.npr_transcript_url(l) for l in re.findall(r"<item>.*?<link>(.*?)</link>", r.text, re.S)]
@@ -2064,7 +2086,7 @@ SOURCES = {
     "lectures":   {"title": "Американистика: рассказы по лекциям Йеля", "check": check_lectures,
                    "every": 1800},
     "articles":   {"title": "Американистика: статьи, интервью Miller Center и подкаст Throughline (Prologue, Библиотека Конгресса, JSTOR Daily, "
-                            "American Heritage, Smithsonian, энциклопедии Арканзаса и Алабамы)", "check": check_articles, "every": 1800},
+                            "American Heritage, Smithsonian, ADST, энциклопедии Арканзаса и Алабамы)", "check": check_articles, "every": 1800},
     "pictures":   {"title": "Американистика: картинка с коротким текстом, по будням", "check": check_pictures,
                    "every": 1800},
 }
