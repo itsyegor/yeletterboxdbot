@@ -39,6 +39,7 @@ import america
 import lectures
 import articles
 import pictures
+import federalist
 from telegram import Update, InputMediaPhoto, LinkPreviewOptions
 from telegram.constants import ParseMode
 from telegram.error import RetryAfter, TelegramError, TimedOut
@@ -140,6 +141,9 @@ class State:
         ar.setdefault("pages", {})         # источник -> {"max": число страниц ленты, "checked": время}
         ar.setdefault("used", [])          # ссылки на статьи, по которым уже был пост или которые не подошли
         ar.setdefault("posted", [])        # журнал: ссылка, заголовок, теги, дата
+        fd = self.data.setdefault("federalist", {})
+        fd.setdefault("next", 1)           # номер следующей статьи «Федералиста»
+        fd.setdefault("posted", [])
         pc = self.data.setdefault("pictures", {})
         pc.setdefault("used", [])          # файлы Commons, по которым уже был пост
         pc.setdefault("posted", [])        # журнал: файл, заголовок, эпоха, тема, дата
@@ -170,7 +174,7 @@ class State:
 
     def channels(self, source):
         got = list(self.data["bindings"].get(source, []))
-        if not got and source in ("articles", "pictures"):  # по умолчанию туда же, куда лекции
+        if not got and source in ("articles", "pictures", "federalist"):  # по умолчанию туда же, куда лекции
             got = list(self.data["bindings"].get("lectures", []))
         return got
 
@@ -1747,7 +1751,10 @@ def topic_problem(tags):
 
 def todays_slots(day):
     """Что выходит в этот день. Выходные: два длинных поста (лекция и статья).
-    Будни: один длинный (через день лекция или статья) и одна картинка - времени читать меньше."""
+    Будни: один длинный (через день лекция или статья) и одна картинка - времени читать меньше.
+    Раз в две недели в субботу вместо статьи - очередной «Федералист»."""
+    if day.weekday() == 5 and day.isocalendar()[1] % 2 == 0:  # каждая вторая суббота - «Федералист»
+        return {"lectures", "federalist"}
     if day.weekday() >= 5:
         return {"lectures", "articles"}
     return {"lectures" if day.toordinal() % 2 == 0 else "articles", "pictures"}
@@ -1958,6 +1965,91 @@ async def check_articles(bot, force=False, preview=False):
         state.save()
         return 0
 
+# ─── «Федералист» ───────────────────────────────────────────────────────────
+
+_federalist_lock = asyncio.Lock()
+
+
+async def federalist_draft(client, st):
+    n = st.get("next", 1)
+    if n > federalist.TOTAL:
+        return None
+    r = await client.get(federalist.TEXT_URL, headers=HEADERS, timeout=90, follow_redirects=True)
+    papers = federalist.parse_all(r.text)
+    if n not in papers:
+        raise RuntimeError(f"в тексте «Федералиста» не нашлась статья № {n}")
+    item = federalist.item(n, papers[n])
+    notes = lectures.parse_answer(await claude_json(articles.notes_prompt(item), LECTURES_MODEL,
+                                                    lectures.NOTES_SCHEMA, max_tokens=6000))
+    if notes is None:
+        raise RuntimeError("Claude не подготовил заметки к статье «Федералиста»")
+    draft = await article_write(client, item, notes)
+    draft["number"] = n
+    return draft
+
+
+async def check_federalist(bot, force=False, preview=False):
+    """Раз в две недели, в субботу после ARTICLES_HOUR, очередная статья «Федералиста» по порядку."""
+    async with _federalist_lock:
+        channels = state.channels("federalist")
+        if not channels and not preview:
+            return 0
+        st = state.data["federalist"]
+        now = datetime.now(timezone(timedelta(hours=LECTURES_UTC_OFFSET)))
+        today = now.date().isoformat()
+        if not preview:
+            state.data["last"]["federalist"] = time.time()
+        if not force and (now.hour < ARTICLES_HOUR or st.get("last_day") == today
+                          or "federalist" not in todays_slots(now.date())):
+            state.save()
+            return 0
+        if not ANTHROPIC_API_KEY:
+            state.save()
+            return 0
+        try:
+            async with httpx.AsyncClient() as client:
+                draft = None if preview else st.get("draft")
+                if draft and lectures.visible_len(draft["text"]) > 4096:
+                    st.pop("draft", None)
+                    draft = None
+                if not draft:
+                    draft = await federalist_draft(client, st)
+                if not draft:
+                    await notify_owner(bot, "federalist", "«Федералист»: все 85 статей уже вышли.")
+                    state.save()
+                    return 0
+                if preview:
+                    st["draft"] = draft
+                    state.save()
+                    await send_post(bot, client, OWNER_ID, lambda lim: draft["text"], [], draft.get("preview"))
+                    await bot.send_message(OWNER_ID, f"Это черновик «Федералиста» № {draft['number']}, в канал он "
+                                                     "пока не ушел. Сейчас: /publish федералист.")
+                    return 1
+                try:
+                    await broadcast(bot, client, channels, lambda lim: draft["text"], [], draft.get("preview"))
+                except Exception:
+                    st.pop("draft", None)
+                    state.save()
+                    raise
+                st["next"] = draft["number"] + 1
+                st["posted"] = (st["posted"] + [{"fragment": draft["fragment"], "title": draft["title"],
+                                                 "date": today, "tags": draft["tags"]}])[-200:]
+                st["last_day"] = today
+                st.pop("draft", None)
+                state.save()
+                log.info("Федералист № %s: %s", draft["number"], draft["title"])
+                return 1
+        except Exception as e:
+            log.exception("Федералист: ошибка")
+            if preview or force:
+                state.save()
+                raise
+            await notify_owner(bot, "federalist", f"«Федералист»: не получилось ({type(e).__name__}: {e}). "
+                                                  "Попробую позже.")
+        state.save()
+        return 0
+
+
 # ─── Картинки ───────────────────────────────────────────────────────────────
 
 _pictures_lock = asyncio.Lock()
@@ -2089,6 +2181,8 @@ SOURCES = {
                             "American Heritage, Smithsonian, ADST, энциклопедии Арканзаса и Алабамы)", "check": check_articles, "every": 1800},
     "pictures":   {"title": "Американистика: картинка с коротким текстом, по будням", "check": check_pictures,
                    "every": 1800},
+    "federalist": {"title": "Американистика: «Федералист» по порядку, раз в две недели", "check": check_federalist,
+                   "every": 1800},
 }
 
 
@@ -2161,6 +2255,7 @@ async def cmd_start(update, context):
         "/check lectures - черновик поста по лекции мне в личку, /publish - выпустить его в канал\n"
         "/check articles - черновик поста по статье, /publish articles - выпустить его\n"
         "/check pictures - черновик картинки, /publish pictures - выпустить ее\n"
+        "/check federalist - черновик очередного «Федералиста», /publish federalist - выпустить\n"
         "/add ник, /remove ник - люди на Letterboxd"
     )
 
@@ -2221,7 +2316,7 @@ async def cmd_remove(update, context):
 SOURCE_ALIASES = {  # /check и /publish понимают и русские названия
     "америка": "america", "анонсы": "america", "лекции": "lectures", "лекция": "lectures",
     "статьи": "articles", "статья": "articles", "картинки": "pictures", "картинка": "pictures",
-    "летербокс": "letterboxd", "светов": "svetov", "канонер": "kanoner",
+    "летербокс": "letterboxd", "федералист": "federalist", "светов": "svetov", "канонер": "kanoner",
 }
 
 
@@ -2247,7 +2342,7 @@ async def cmd_check(update, context):
         await update.message.reply_text(f"Проверяю {name}...")
         try:
             fn = SOURCES[name]["check"]
-            if name in ("lectures", "articles", "pictures"):  # посты, которые пишет Claude, сначала владельцу
+            if name in ("lectures", "articles", "pictures", "federalist"):  # посты, которые пишет Claude, сначала владельцу
                 n = await fn(context.bot, force=True, preview=True)
                 lines.append(f"{name}: черновиков {n}")
                 continue
@@ -2263,15 +2358,15 @@ async def cmd_check(update, context):
 async def cmd_publish(update, context):
     """Черновик поста по лекции (/publish) или по статье (/publish articles) - в канал сейчас."""
     name = source_name(context.args[0]) if context.args else "lectures"
-    if name not in ("lectures", "articles", "pictures"):
-        await update.message.reply_text("Можно: /publish, /publish articles или /publish pictures")
+    if name not in ("lectures", "articles", "pictures", "federalist"):
+        await update.message.reply_text("Можно: /publish, /publish articles, /publish pictures, /publish federalist")
         return
     if not state.channels(name):
         await update.message.reply_text(f"{name} не подключен к каналу")
         return
     try:
-        n = await {"lectures": check_lectures, "articles": check_articles,
-                   "pictures": check_pictures}[name](context.bot, force=True)
+        n = await {"lectures": check_lectures, "articles": check_articles, "pictures": check_pictures,
+                   "federalist": check_federalist}[name](context.bot, force=True)
     except Exception as e:
         await update.message.reply_text(f"Не получилось: {type(e).__name__}: {str(e)[:300]}")
         return
