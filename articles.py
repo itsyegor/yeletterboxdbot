@@ -286,15 +286,14 @@ def build_post(post, item, quote_ru=None, image=None, limit=4000):
                                     str(item["year"]) if item["year"] else ""] if x)
     head = ["📰 <b>ИЗ СТАТЬИ</b>", f'📄 <a href="{esc(item["url"])}">Оригинал (англ.)</a>', "",
             f"<b>{esc(america._cut(clean(post['title']), 200))}</b>", f"<i>{esc(byline)}</i>", ""]
-    before, after = esc(clean(post.get("before"))), esc(clean(post.get("after")))
     tags = " ".join("#" + t for t in post_tags(post, item))
 
-    def assemble(q):
-        lines = head + ([before] if before else [])
+    def assemble(before, q, after):
+        lines = head + ([esc(before)] if before else [])
         if q:
             lines += ["", f"<blockquote expandable>{esc(q)}</blockquote>"]
         if after:
-            lines += ["", after]
+            lines += ["", esc(after)]
         if image and image.get("caption"):
             credit = lectures.image_credit(image)
             lines += ["", f"🖼 <i>{esc(clean(image['caption']))}</i>"
@@ -303,12 +302,5 @@ def build_post(post, item, quote_ru=None, image=None, limit=4000):
         lines += ["", tags]
         return "\n".join(lines)
 
-    q = clean(quote_ru) if quote_ru else ""
-    text = assemble(q)
-    while q and lectures.visible_len(text) > limit:
-        over = lectures.visible_len(text) - limit
-        q = lectures._trim_quote(q, max(0, len(q) - over - 10))
-        if len(q) < 400:
-            q = ""
-        text = assemble(q)
-    return text
+    return lectures.fit_post(assemble, clean(post.get("before")), clean(quote_ru) if quote_ru else "",
+                             clean(post.get("after")), min(limit, 3900))

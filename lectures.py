@@ -455,7 +455,7 @@ EDIT_PROMPT = """Ты редактор телеграм-канала об ист
 Проверь каждый абзац:
 1. Каждое событие, решение, закон, документ, имя и термин понятны без исходника: что именно произошло или что в нем было, кто участвовал, сколько, чем кончилось. Если в черновике только намек («день позора», «было два правительства»), раскрой его по исходнику в одну-две фразы. Если по исходнику не раскрыть или факт не связан с рассказом, удали его.
 2. Каждый факт связан с тем, о чем рассказ; читатель понимает, зачем он здесь. Перечни книг, имен и событий сократи до того, что работает на рассказ.
-3. Абзацы короткие: 2-4 предложения, до 500 знаков. Длинные раздели по смыслу.
+3. Абзацы короткие: 2-4 предложения, до 500 знаков. Длинные раздели по смыслу. Весь текст поста - не больше 2500 знаков: пост в телеграме ограничен, и туда еще встанут цитата и подпись к картинке.
 4. Переходы между абзацами естественные, текст читается как один рассказ.
 5. Если ниже дана цитата, текст поста не повторяет ее содержание: то, что пересказано в тексте и сказано в цитате, убери из текста, оставив короткую подводку к цитате.
 
@@ -657,6 +657,43 @@ def _trim_quote(q, n):
     return cut[: dot + 1] if dot > n // 3 else cut.rstrip() + "…"
 
 
+def fit_post(assemble, before, quote, after, limit=3900):
+    """Укладывает пост в лимит Telegram (4096 знаков, считаем с запасом).
+
+    assemble(before, quote, after) -> HTML. Порядок: цитата укорачивается до ~800 знаков, потом выпадают
+    абзацы из середины рассказа (первый абзац и вывод остаются), и только потом цитата сокращается
+    дальше или убирается совсем - текст подводит к ней, поэтому она ценнее среднего абзаца.
+    """
+    q = quote or ""
+    b = [p for p in before.split("\n\n") if p.strip()]
+    a = [p for p in after.split("\n\n") if p.strip()]
+    text = lambda: assemble("\n\n".join(b), q, "\n\n".join(a))
+    over = lambda: visible_len(text()) - limit
+
+    def shrink_quote(floor):
+        nonlocal q
+        while q and over() > 0 and len(q) > floor:
+            q = _trim_quote(q, max(floor, len(q) - over() - 10))
+            if len(q) <= floor and over() > 0:
+                break
+
+    shrink_quote(800)
+    while over() > 0 and len(b) + len(a) > 2:
+        if len(b) > 1:
+            b.pop()          # конец первой части - середина рассказа
+        else:
+            a.pop(0)         # начало второй части; вывод в конце остается
+    shrink_quote(400)
+    if over() > 0:
+        q = ""
+    while over() > 0:        # крайний случай: укорачиваем последний абзац
+        part = a if a else b
+        if not part or len(part[-1]) < 200:
+            break
+        part[-1] = part[-1][: int(len(part[-1]) * 0.9)].rsplit(" ", 1)[0] + "…"
+    return text()
+
+
 def build_post(post, course, lecture_no, lectures_total, lecture, segment, quote_ru=None, limit=4000, image=None):
     """
     🎓 ИЗ ЛЕКЦИИ
@@ -682,16 +719,14 @@ def build_post(post, course, lecture_no, lectures_total, lecture, segment, quote
             f"<b>{_esc(america._cut(_clean(post['title']), 200))}</b>",
             f"<i>{_esc(course['author_full'])} · {_esc(course['title'])} · Йель, {course['year']} · "
             f"лекция {lecture_no} из {lectures_total}</i>", ""]
-    before = _esc(_clean(post.get("before")))
-    after = _esc(_clean(post.get("after")))
     tags = " ".join("#" + t for t in post_tags(post, course))
 
-    def assemble(q):
-        lines = head + ([before] if before else [])
+    def assemble(before, q, after):
+        lines = head + ([_esc(before)] if before else [])
         if q:
             lines += ["", f"<blockquote expandable>{_esc(q)}</blockquote>"]
         if after:
-            lines += ["", after]
+            lines += ["", _esc(after)]
         if image and image.get("caption"):
             credit = image_credit(image)
             lines += ["", f"🖼 <i>{_esc(_clean(image['caption']))}</i>"
@@ -700,12 +735,5 @@ def build_post(post, course, lecture_no, lectures_total, lecture, segment, quote
         lines += ["", tags]
         return "\n".join(lines)
 
-    q = _clean(quote_ru) if quote_ru else ""
-    text = assemble(q)
-    while q and visible_len(text) > limit:
-        over = visible_len(text) - limit
-        q = _trim_quote(q, max(0, len(q) - over - 10))
-        if len(q) < 400:
-            q = ""
-        text = assemble(q)
-    return text
+    return fit_post(assemble, _clean(post.get("before")), _clean(quote_ru) if quote_ru else "",
+                    _clean(post.get("after")), min(limit, 3900))

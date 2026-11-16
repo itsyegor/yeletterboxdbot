@@ -1618,7 +1618,12 @@ async def lecture_image(client, queries, post_text):
 
 
 async def publish_lecture(bot, client, channels, st, draft, today):
-    await broadcast(bot, client, channels, lambda lim: draft["text"], [], draft.get("preview"))
+    try:
+        await broadcast(bot, client, channels, lambda lim: draft["text"], [], draft.get("preview"))
+    except Exception:
+        st.pop("draft", None)  # иначе бот каждый раз пытался бы отправить тот же негодный черновик
+        state.save()
+        raise
     st["used"].append(draft["fragment"])
     st["posted"] = (st["posted"] + [{"fragment": draft["fragment"], "title": draft["title"], "date": today,
                                      "tags": draft["tags"]}])[-1000:]
@@ -1648,16 +1653,20 @@ async def check_lectures(bot, force=False, preview=False):
             state.save()
             return 0
         if not ANTHROPIC_API_KEY:
-            await notify_owner(bot, "lectures", "Конспекты: без ANTHROPIC_API_KEY не могу писать посты.")
+            await notify_owner(bot, "lectures", "Лекции: без ANTHROPIC_API_KEY не могу писать посты.")
             state.save()
             return 0
         try:
             async with httpx.AsyncClient() as client:
                 draft = None if preview else st.get("draft")
+                if draft and lectures.visible_len(draft["text"]) > 4096:  # черновик старой версии, длиннее лимита
+                    log.info("Черновик %s длиннее лимита Telegram, делаю новый", draft.get("fragment"))
+                    st.pop("draft", None)
+                    draft = None
                 if not draft:
                     draft = await lecture_draft(bot, client, st)
                 if not draft:
-                    await notify_owner(bot, "lectures", "Конспекты: все сюжеты всех курсов уже использованы. "
+                    await notify_owner(bot, "lectures", "Лекции: все сюжеты всех курсов уже использованы. "
                                                         "Пора добавить новые курсы.")
                     state.save()
                     return 0
@@ -1676,7 +1685,7 @@ async def check_lectures(bot, force=False, preview=False):
             if preview or force:  # ручной запуск: ошибку покажет сама команда
                 state.save()
                 raise
-            await notify_owner(bot, "lectures", f"Конспекты: не получилось подготовить пост ({type(e).__name__}: {e}). "
+            await notify_owner(bot, "lectures", f"Лекции: не получилось подготовить пост ({type(e).__name__}: {e}). "
                                                 "Попробую позже.")
         state.save()
         return 0
@@ -1811,6 +1820,10 @@ async def check_articles(bot, force=False, preview=False):
         try:
             async with httpx.AsyncClient() as client:
                 draft = None if preview else st.get("draft")
+                if draft and lectures.visible_len(draft["text"]) > 4096:  # черновик старой версии, длиннее лимита
+                    log.info("Черновик %s длиннее лимита Telegram, делаю новый", draft.get("fragment"))
+                    st.pop("draft", None)
+                    draft = None
                 if not draft:
                     draft = await article_draft(client, st)
                 if not draft:
@@ -1825,7 +1838,12 @@ async def check_articles(bot, force=False, preview=False):
                                                      "Он выйдет следующим по расписанию. Сейчас: /publish articles. "
                                                      "Другой черновик: /check articles.")
                     return 1
-                await broadcast(bot, client, channels, lambda lim: draft["text"], [], draft.get("preview"))
+                try:
+                    await broadcast(bot, client, channels, lambda lim: draft["text"], [], draft.get("preview"))
+                except Exception:
+                    st.pop("draft", None)  # следующая попытка сделает новый черновик, а не повторит этот
+                    state.save()
+                    raise
                 st["used"].append(draft["fragment"])
                 st["posted"] = (st["posted"] + [{"fragment": draft["fragment"], "title": draft["title"],
                                                  "date": today, "tags": draft["tags"]}])[-1000:]
@@ -1917,6 +1935,10 @@ async def check_pictures(bot, force=False, preview=False):
         try:
             async with httpx.AsyncClient() as client:
                 draft = None if preview else st.get("draft")
+                if draft and lectures.visible_len(draft["text"]) > 4096:  # черновик старой версии, длиннее лимита
+                    log.info("Черновик %s длиннее лимита Telegram, делаю новый", draft.get("fragment"))
+                    st.pop("draft", None)
+                    draft = None
                 if not draft:
                     draft = await picture_draft(client, st)
                 if not draft:
@@ -1930,7 +1952,12 @@ async def check_pictures(bot, force=False, preview=False):
                     await bot.send_message(OWNER_ID, "Это черновик картинки, в канал она пока не ушла. "
                                                      "Сейчас: /publish pictures. Другая: /check pictures.")
                     return 1
-                await broadcast(bot, client, channels, lambda lim: draft["text"], [], draft.get("preview"))
+                try:
+                    await broadcast(bot, client, channels, lambda lim: draft["text"], [], draft.get("preview"))
+                except Exception:
+                    st.pop("draft", None)  # следующая попытка сделает новый черновик, а не повторит этот
+                    state.save()
+                    raise
                 st["used"].append(draft["fragment"])
                 st["posted"] = (st["posted"] + [{"fragment": draft["fragment"], "title": draft["title"],
                                                  "era": draft["era"], "theme": draft["theme"],
