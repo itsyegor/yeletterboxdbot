@@ -40,10 +40,12 @@ import lectures
 import articles
 import pictures
 import federalist
-from telegram import Update, InputMediaPhoto, LinkPreviewOptions
+from telegram import (Update, InputMediaPhoto, LinkPreviewOptions, InlineKeyboardButton, InlineKeyboardMarkup,
+                      ReplyKeyboardMarkup, BotCommand)
 from telegram.constants import ParseMode
 from telegram.error import RetryAfter, TelegramError, TimedOut
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import (ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes,
+                          filters)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -614,14 +616,20 @@ async def broadcast(bot, client, channels, text_builder, images, preview_url=Non
 
 
 async def notify_owner(bot, key, text):
-    """Сообщение владельцу об ошибке, не чаще раза в сутки на источник."""
+    """Уведомление владельцу сразу, как случилась проблема, но об одной и той же (key) - не чаще раза в сутки.
+    Все уведомления пишутся в журнал, его видно в меню («🔔 Уведомления»)."""
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     if state.data["errors"].get(key) == today or not OWNER_ID:
         return
     state.data["errors"][key] = today
+    notices = state.data.setdefault("notices", [])
+    notices.append({"t": datetime.now(timezone(timedelta(hours=LECTURES_UTC_OFFSET))).strftime("%d.%m %H:%M"),
+                    "text": text})
+    del notices[:-30]
     state.save()
     try:
-        await bot.send_message(OWNER_ID, text)
+        await bot.send_message(OWNER_ID, "🔔 " + text, reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("Понятно", callback_data="n:ok")]]))
     except TelegramError:
         log.warning("Не смог написать владельцу (он нажимал /start у бота?)")
 
@@ -1691,10 +1699,7 @@ async def check_lectures(bot, force=False, preview=False):
                 if preview:
                     st["draft"] = draft
                     state.save()
-                    await send_post(bot, client, OWNER_ID, lambda lim: draft["text"], [], draft.get("preview"))
-                    await bot.send_message(OWNER_ID, "Это черновик, в канал он пока не ушел. Он выйдет следующим "
-                                                     "по расписанию. Опубликовать сейчас: /publish. "
-                                                     "Другой черновик: /check lectures.")
+                    await send_draft(bot, "lectures", draft)
                     return 1
                 await publish_lecture(bot, client, channels, st, draft, today)
                 return 1
@@ -1946,10 +1951,7 @@ async def check_articles(bot, force=False, preview=False):
                 if preview:
                     st["draft"] = draft
                     state.save()
-                    await send_post(bot, client, OWNER_ID, lambda lim: draft["text"], [], draft.get("preview"))
-                    await bot.send_message(OWNER_ID, "Это черновик поста по статье, в канал он пока не ушел. "
-                                                     "Он выйдет следующим по расписанию. Сейчас: /publish articles. "
-                                                     "Другой черновик: /check articles.")
+                    await send_draft(bot, "articles", draft)
                     return 1
                 try:
                     await broadcast(bot, client, channels, lambda lim: draft["text"], [], draft.get("preview"))
@@ -1999,6 +2001,8 @@ async def check_longreads(bot, force=False, preview=False):
             return 0
         n_articles = len([s for s, v in articles.SOURCES.items() if v.get("kind") != "series"])
         kinds = ["lectures", "articles"] if random.random() < 1 / (n_articles + 1) else ["articles", "lectures"]
+        if not preview:  # если черновик уже показан владельцу, выходит он
+            kinds.sort(key=lambda k: not state.data[k].get("draft"))
         for kind in kinds:
             fn = check_lectures if kind == "lectures" else check_articles
             n = await fn(bot, force=True, preview=preview)
@@ -2066,9 +2070,7 @@ async def check_federalist(bot, force=False, preview=False):
                 if preview:
                     st["draft"] = draft
                     state.save()
-                    await send_post(bot, client, OWNER_ID, lambda lim: draft["text"], [], draft.get("preview"))
-                    await bot.send_message(OWNER_ID, f"Это черновик «Федералиста» № {draft['number']}, в канал он "
-                                                     "пока не ушел. Сейчас: /publish федералист.")
+                    await send_draft(bot, "federalist", draft)
                     return 1
                 try:
                     await broadcast(bot, client, channels, lambda lim: draft["text"], [], draft.get("preview"))
@@ -2182,9 +2184,7 @@ async def check_pictures(bot, force=False, preview=False):
                 if preview:
                     st["draft"] = draft
                     state.save()
-                    await send_post(bot, client, OWNER_ID, lambda lim: draft["text"], [], draft.get("preview"))
-                    await bot.send_message(OWNER_ID, "Это черновик картинки, в канал она пока не ушла. "
-                                                     "Сейчас: /publish pictures. Другая: /check pictures.")
+                    await send_draft(bot, "pictures", draft)
                     return 1
                 try:
                     await broadcast(bot, client, channels, lambda lim: draft["text"], [], draft.get("preview"))
@@ -2244,7 +2244,7 @@ async def scheduler(app):
     await asyncio.sleep(15)
     while True:
         for name, src in SOURCES.items():
-            if not state.channels(name):
+            if not state.channels(name) or name in state.data.get("paused", []):
                 continue
             if time.time() - state.data["last"].get(name, 0) < src["every"]:
                 continue
@@ -2260,14 +2260,16 @@ async def scheduler(app):
 async def post_init(app):
     # названия каналов, привязанных старой версией бота
     for chat_id in {c for lst in state.data["bindings"].values() for c in lst}:
-        if str(chat_id) in state.data["channel_titles"]:
-            continue
-        try:
+        try:  # названия обновляются при каждом запуске: в меню - как сейчас в Telegram
             chat = await app.bot.get_chat(chat_id)
             state.data["channel_titles"][str(chat_id)] = chat.title or str(chat_id)
         except TelegramError:
             pass
     state.save()
+    try:
+        await app.bot.set_my_commands([BotCommand("menu", "Меню"), BotCommand("help", "Справка по командам")])
+    except TelegramError:
+        pass
     app.create_task(scheduler(app))
 
 # ─── Команды ────────────────────────────────────────────────────────────────
@@ -2291,6 +2293,9 @@ def sources_overview():
 
 @owner_only
 async def cmd_start(update, context):
+    if update.message and (update.message.text or "").startswith("/start"):
+        await cmd_menu(update, context)
+        return
     await update.message.reply_text(
         "Лента: собираю новое из разных источников и публикую в твои каналы.\n\n"
         "Источники:\n" + sources_overview() + "\n\n"
@@ -2472,6 +2477,475 @@ async def channel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg.append("Не знаю источники: " + ", ".join(unknown) + ". Есть: " + ", ".join(SOURCES))
     await tell_owner(" ".join(msg))
 
+# ─── Меню с кнопками ────────────────────────────────────────────────────────
+#
+# Одно сообщение-меню, которое бот редактирует на месте: каналы -> рубрики канала -> рубрика.
+# Постоянная кнопка «☰ Меню» под полем ввода присылает свежее меню и убирает старое.
+# Черновики приходят отдельным сообщением с кнопками; висит не больше одного на рубрику.
+
+MENU_BUTTON = "☰ Меню"
+
+RUBRICS = {  # что показывается в меню канала; ключ - источник из SOURCES
+    "longreads": {"title": "Длинные посты", "draft": True},
+    "pictures": {"title": "Картинки", "draft": True},
+    "federalist": {"title": "«Федералист»", "draft": True},
+    "america": {"title": "Анонсы лекций"},
+    "letterboxd": {"title": "Letterboxd"},
+    "svetov": {"title": "Светов"},
+    "kanoner": {"title": "Канонер"},
+}
+DRAFT_FN = {"longreads": lambda: check_longreads, "lectures": lambda: check_lectures,
+            "articles": lambda: check_articles, "pictures": lambda: check_pictures,
+            "federalist": lambda: check_federalist}
+LONG_KINDS = ("lectures", "articles")  # черновики длинных постов хранятся у этих рубрик
+
+
+def ui():
+    u = state.data.setdefault("ui", {})
+    u.setdefault("draft_msgs", {})
+    u.setdefault("last_check", {})
+    return u
+
+
+def btn(text, data):
+    return InlineKeyboardButton(text, callback_data=data[:64])
+
+
+def local_now():
+    return datetime.now(timezone(timedelta(hours=LECTURES_UTC_OFFSET)))
+
+
+def all_channels():
+    out = []
+    for name in RUBRICS:
+        for c in state.channels(name):
+            if c not in out:
+                out.append(c)
+    return out
+
+
+def rubric_drafts(rubric):
+    kinds = LONG_KINDS if rubric == "longreads" else (rubric,)
+    return [(k, state.data[k]["draft"]) for k in kinds if state.data.get(k, {}).get("draft")]
+
+
+def last_posted(rubric):
+    """(дата, заголовок) последнего поста рубрики или None."""
+    logs = {"longreads": ["lectures", "articles"], "pictures": ["pictures"], "federalist": ["federalist"],
+            "america": ["america"]}.get(rubric)
+    if not logs:
+        return None
+    items = [p for k in logs for p in state.data.get(k, {}).get("posted", []) if p.get("date")]
+    if not items:
+        return None
+    p = max(items, key=lambda p: p["date"])
+    return p["date"], p.get("title", "")
+
+
+def next_slot(rubric):
+    """Когда рубрика выйдет в следующий раз (по расписанию), строкой."""
+    now = local_now()
+    for d in range(0, 15):
+        day = (now + timedelta(days=d)).date()
+        if rubric == "longreads":
+            hrs = long_hours(day)
+        elif rubric in ("pictures", "federalist"):
+            hrs = ([PICTURES_HOUR] if rubric == "pictures" else [ARTICLES_HOUR]) if rubric in todays_slots(day) else []
+        else:
+            return None
+        for h in hrs:
+            if d or h > now.hour:
+                when = "сегодня" if d == 0 else "завтра" if d == 1 else day.strftime("%d.%m")
+                return f"{when} {h}:00"
+    return None
+
+
+def fmt_date(iso):
+    try:
+        return datetime.fromisoformat(iso).strftime("%d.%m")
+    except ValueError:
+        return iso
+
+
+def schedule_text(rubric):
+    if rubric == "longreads":
+        h = LONG_HOURS
+        return f"Будни — {h[0]}:00, выходные — " + " и ".join(f"{x}:00" for x in h[:2]) + " (по Алматы)"
+    if rubric == "pictures":
+        return f"Будни — {PICTURES_HOUR}:00 (по Алматы)"
+    if rubric == "federalist":
+        return f"Раз в две недели, суббота {ARTICLES_HOUR}:00 · следующий — № {state.data['federalist'].get('next', 1)}"
+    return f"Проверка раз в {hours(SOURCES[rubric]['every'])}"
+
+
+def screen_main():
+    rows = [[btn(state.title(c), f"c:{c}")] for c in all_channels()]
+    n = len(state.data.get("notices", []))
+    rows.append([btn(f"🔔 Уведомления ({n})" if n else "🔔 Уведомления", "nl")])
+    return "<b>Каналы</b>", InlineKeyboardMarkup(rows)
+
+
+async def screen_channel(bot, chat_id):
+    title = state.title(chat_id)
+    try:
+        members = await bot.get_chat_member_count(chat_id)
+        title += f" · {members} подписч."
+    except TelegramError:
+        pass
+    lines = [f"<b>{lectures._esc(title)}</b>", ""]
+    rows, pair = [], []
+    for r, info in RUBRICS.items():
+        if chat_id not in state.channels(r):
+            continue
+        mark = "⏸ " if r in state.data.get("paused", []) else ""
+        last = last_posted(r)
+        nxt = next_slot(r)
+        status = " · ".join(x for x in [
+            f"последний {fmt_date(last[0])}" if last else "",
+            f"следующий {nxt}" if nxt and not mark else ""] if x)
+        lines.append(f"{mark}{info['title']}" + (f" — {status}" if status else ""))
+        pair.append(btn(mark + info["title"], f"r:{chat_id}:{r}"))
+        if len(pair) == 2:
+            rows.append(pair)
+            pair = []
+    if pair:
+        rows.append(pair)
+    rows.append([btn("‹ Назад", "m")])
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
+def screen_rubric(chat_id, rubric):
+    info = RUBRICS[rubric]
+    paused = rubric in state.data.get("paused", [])
+    lines = [f"<b>{info['title']}</b>" + (" · на паузе" if paused else ""), schedule_text(rubric)]
+    last = last_posted(rubric)
+    if last:
+        lines.append(f"Последний: {fmt_date(last[0])}, «{lectures._esc(last[1][:80])}»")
+    nxt = next_slot(rubric)
+    if nxt and not paused:
+        lines.append(f"Следующий: {nxt}")
+    if rubric == "longreads":
+        week = recent_topics()
+        longs = [r for r in week if r[1] in LONG_KINDS]
+        tags = sorted({t for r in longs for t in r[2]})
+        lines.append(f"За неделю: {len(longs)} · темы: " + (", ".join(tags[:8]) if tags else "—"))
+    if ui()["last_check"].get(rubric):
+        lines.append(ui()["last_check"][rubric])
+    rows = []
+    if info.get("draft"):
+        if ui().get("busy", {}).get(rubric):
+            rows.append([btn("⏳ Готовлю черновик…", f"r:{chat_id}:{rubric}")])
+        elif rubric_drafts(rubric):
+            rows.append([btn("👁 Черновик готов ↓", f"ds:{chat_id}:{rubric}")])
+        else:
+            rows.append([btn("👁 Показать черновик", f"dn:{chat_id}:{rubric}")])
+    else:
+        rows.append([btn("🔄 Проверить сейчас", f"k:{chat_id}:{rubric}")])
+    if rubric == "letterboxd":
+        rows.append([btn("👥 Подписки", f"lb:{chat_id}")])
+    rows.append([btn("▶️ Возобновить" if paused else "⏸ Пауза", f"p:{chat_id}:{rubric}"),
+                 btn("‹ Назад", f"c:{chat_id}")])
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
+async def lb_users():
+    async with httpx.AsyncClient() as client:
+        users = await current_users(client)
+    state.save()
+    return users
+
+
+async def screen_lb(chat_id, users=None):
+    users = users if users is not None else await lb_users()
+    rows, pair = [], []
+    for u in users[:60]:
+        pair.append(btn(f"✖ {u}", f"lr:{chat_id}:{u}"))
+        if len(pair) == 2:
+            rows.append(pair)
+            pair = []
+    if pair:
+        rows.append(pair)
+    rows.append([btn("➕ Добавить", f"la:{chat_id}"), btn("‹ Назад", f"r:{chat_id}:letterboxd")])
+    text = f"<b>Letterboxd · подписки ({len(users)})</b>"
+    if len(users) > 60:
+        text += "\nПоказаны первые 60."
+    return text, InlineKeyboardMarkup(rows)
+
+
+def screen_notices():
+    notices = state.data.get("notices", [])[-10:]
+    text = "<b>🔔 Уведомления</b>\n\n" + ("\n\n".join(
+        f"<i>{n['t']}</i> {lectures._esc(n['text'][:300])}" for n in reversed(notices)) or "Пусто.")
+    rows = [[btn("Очистить", "nc"), btn("‹ Назад", "m")]] if notices else [[btn("‹ Назад", "m")]]
+    return text, InlineKeyboardMarkup(rows)
+
+
+async def show(bot, text, kb, message=None):
+    """Показывает экран меню: правит сообщение-меню, если оно есть, иначе присылает новое."""
+    opts = dict(parse_mode=ParseMode.HTML, reply_markup=kb, link_preview_options=LinkPreviewOptions(is_disabled=True))
+    mid = message.message_id if message else ui().get("menu_msg")
+    if mid:
+        try:
+            await bot.edit_message_text(text, chat_id=OWNER_ID, message_id=mid, **opts)
+            return
+        except TelegramError as e:
+            if "not modified" in str(e).lower():
+                return
+    msg = await bot.send_message(OWNER_ID, text, **opts)
+    ui()["menu_msg"] = msg.message_id
+    state.save()
+
+
+async def send_draft(bot, kind, draft):
+    """Черновик отдельным сообщением с кнопками; прежний черновик этой рубрики удаляется."""
+    old = ui()["draft_msgs"].pop(kind, None)
+    if old:
+        try:
+            await bot.delete_message(OWNER_ID, old)
+        except TelegramError:
+            pass
+    lpo = (LinkPreviewOptions(url=draft["preview"], prefer_large_media=True, show_above_text=True)
+           if draft.get("preview") else LinkPreviewOptions(is_disabled=True))
+    kb = InlineKeyboardMarkup([[btn("✅ Опубликовать", f"d:{kind}:pub"), btn("🔄 Другой", f"d:{kind}:new")],
+                               [btn("🗑 Удалить", f"d:{kind}:del"), btn("✖ Закрыть", f"d:{kind}:close")]])
+    msg = await bot.send_message(OWNER_ID, text=draft["text"], parse_mode=ParseMode.HTML,
+                                 link_preview_options=lpo, reply_markup=kb)
+    ui()["draft_msgs"][kind] = msg.message_id
+    state.save()
+
+
+def rubric_of(kind):
+    return "longreads" if kind in LONG_KINDS else kind
+
+
+async def make_draft(bot, rubric, chat_id):
+    """Готовит черновик в фоне: пока идет, на экране рубрики «⏳ Готовлю черновик…»."""
+    busy = ui().setdefault("busy", {})
+    busy[rubric] = True
+    try:
+        await show(bot, *screen_rubric(chat_id, rubric))
+        n = await DRAFT_FN[rubric]()(bot, force=True, preview=True)
+        if not n:
+            ui()["last_check"][rubric] = "Черновик не получился: подходящего материала не нашлось."
+    except Exception as e:
+        log.exception("Черновик %s", rubric)
+        ui()["last_check"][rubric] = f"Черновик не получился: {type(e).__name__}: {str(e)[:200]}"
+    finally:
+        busy.pop(rubric, None)
+        state.save()
+    await show(bot, *screen_rubric(chat_id, rubric))
+
+
+async def run_check(bot, rubric, chat_id):
+    ui()["last_check"][rubric] = "⏳ Проверяю…"
+    await show(bot, *screen_rubric(chat_id, rubric))
+    try:
+        n = await SOURCES[rubric]["check"](bot)
+        res = f"новых постов {n}"
+    except Exception as e:
+        log.exception("Проверка %s из меню", rubric)
+        res = f"ошибка: {type(e).__name__}: {str(e)[:200]}"
+    ui()["last_check"][rubric] = f"Проверка {local_now().strftime('%H:%M')}: {res}"
+    state.save()
+    await show(bot, *screen_rubric(chat_id, rubric))
+
+
+def lb_add(nick):
+    lb = state.data["lb"]
+    if nick in lb["removed"]:
+        lb["removed"].remove(nick)
+    if nick not in lb["added"]:
+        lb["added"].append(nick)
+    state.save()
+
+
+def lb_remove(nick):
+    lb = state.data["lb"]
+    if nick in lb["added"]:
+        lb["added"].remove(nick)
+    if nick not in lb["removed"]:
+        lb["removed"].append(nick)
+    state.save()
+
+
+def menu_channel_for(rubric):
+    chans = state.channels(rubric)
+    return chans[0] if chans else None
+
+
+async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q or not update.effective_user or update.effective_user.id != OWNER_ID:
+        return
+    data, bot = q.data or "", context.bot
+    parts = data.split(":")
+    kind = parts[0]
+
+    def cid(i=1):
+        return int(parts[i])
+
+    # уведомление
+    if data == "n:ok":
+        await q.answer()
+        try:
+            await q.message.delete()
+        except TelegramError:
+            pass
+        return
+    # черновик
+    if kind == "d":
+        dkind, action = parts[1], parts[2]
+        rubric = rubric_of(dkind)
+        ch = menu_channel_for(rubric)
+        st = state.data.get(dkind, {})
+        if action == "close":
+            await q.answer("Черновик остался в очереди и выйдет по расписанию")
+            ui()["draft_msgs"].pop(dkind, None)
+            state.save()
+            try:
+                await q.message.delete()
+            except TelegramError:
+                pass
+            return
+        if action == "del":
+            st.pop("draft", None)
+            ui()["draft_msgs"].pop(dkind, None)
+            state.save()
+            await q.answer("Черновик удален")
+            try:
+                await q.message.delete()
+            except TelegramError:
+                pass
+        elif action == "pub":
+            if not st.get("draft"):
+                await q.answer("Этого черновика уже нет")
+                return
+            await q.answer("Публикую…")
+            try:
+                n = await DRAFT_FN[dkind]()(bot, force=True)
+            except Exception as e:
+                await notify_owner(bot, f"pub-{dkind}-{time.time()}", f"Не опубликовал: {type(e).__name__}: {e}")
+                return
+            if n and rubric == "longreads":  # ручная публикация занимает ближайший слот расписания
+                lr = state.data.setdefault("longreads", {})
+                today = local_now().date().isoformat()
+                if lr.get("day") != today:
+                    lr["day"], lr["done"] = today, 0
+                lr["done"] += 1
+            ui()["draft_msgs"].pop(dkind, None)
+            state.save()
+            try:
+                await q.message.delete()
+            except TelegramError:
+                pass
+        elif action == "new":
+            st.pop("draft", None)
+            ui()["draft_msgs"].pop(dkind, None)
+            state.save()
+            await q.answer("Готовлю другой черновик, это минута-две")
+            try:
+                await q.message.delete()
+            except TelegramError:
+                pass
+            if ch is not None:
+                asyncio.create_task(make_draft(bot, rubric, ch))
+            return
+        if ch is not None and ui().get("menu_msg"):
+            await show(bot, *screen_rubric(ch, rubric))
+        return
+
+    await q.answer()
+    if data == "m":
+        await show(bot, *screen_main(), message=q.message)
+    elif data == "nl":
+        await show(bot, *screen_notices(), message=q.message)
+    elif data == "nc":
+        state.data["notices"] = []
+        state.save()
+        await show(bot, *screen_main(), message=q.message)
+    elif kind == "c":
+        await show(bot, *(await screen_channel(bot, cid())), message=q.message)
+    elif kind == "r":
+        await show(bot, *screen_rubric(cid(), parts[2]), message=q.message)
+    elif kind == "p":
+        paused = state.data.setdefault("paused", [])
+        if parts[2] in paused:
+            paused.remove(parts[2])
+        else:
+            paused.append(parts[2])
+        state.save()
+        await show(bot, *screen_rubric(cid(), parts[2]), message=q.message)
+    elif kind == "dn":
+        if not ui().get("busy", {}).get(parts[2]):
+            asyncio.create_task(make_draft(bot, parts[2], cid()))
+    elif kind == "ds":
+        for dkind, draft in rubric_drafts(parts[2]):
+            await send_draft(bot, dkind, draft)
+    elif kind == "k":
+        asyncio.create_task(run_check(bot, parts[2], cid()))
+    elif kind == "lb":
+        await show(bot, "<b>Letterboxd · подписки</b>\n⏳ Загружаю список…", None, message=q.message)
+        await show(bot, *(await screen_lb(cid())), message=q.message)
+    elif kind == "lr":
+        await show(bot, f"Убрать <b>{lectures._esc(parts[2])}</b> из ленты Letterboxd?", InlineKeyboardMarkup(
+            [[btn("Да, убрать", f"ly:{parts[1]}:{parts[2]}"), btn("Нет", f"lb:{parts[1]}")]]), message=q.message)
+    elif kind == "ly":
+        lb_remove(parts[2])
+        await show(bot, *(await screen_lb(cid())), message=q.message)
+    elif kind == "la":
+        ui()["await"] = {"what": "lb_add", "chat": cid()}
+        state.save()
+        await show(bot, "Пришли ник на Letterboxd или ссылку на профиль.", InlineKeyboardMarkup(
+            [[btn("Отмена", f"lb:{parts[1]}")]]), message=q.message)
+
+
+async def drop_menu(bot):
+    mid = ui().pop("menu_msg", None)
+    if mid:
+        try:
+            await bot.delete_message(OWNER_ID, mid)
+        except TelegramError:
+            pass
+
+
+@owner_only
+async def cmd_menu(update, context):
+    """Свежее меню вместо старого; заодно ставит постоянную кнопку «☰ Меню» под полем ввода."""
+    try:
+        await update.message.delete()
+    except TelegramError:
+        pass
+    await drop_menu(context.bot)
+    if not ui().get("keyboard_set"):
+        await context.bot.send_message(OWNER_ID, "Меню теперь всегда под полем ввода.", reply_markup=ReplyKeyboardMarkup(
+            [[MENU_BUTTON]], resize_keyboard=True, is_persistent=True))
+        ui()["keyboard_set"] = True
+    ui().pop("await", None)
+    state.save()
+    await show(context.bot, *screen_main())
+
+
+@owner_only
+async def on_text(update, context):
+    """Кнопка «☰ Меню» и ответы на вопросы меню (ник для Letterboxd)."""
+    text = (update.message.text or "").strip()
+    if text == MENU_BUTTON:
+        await cmd_menu(update, context)
+        return
+    wait = ui().get("await")
+    if wait and wait.get("what") == "lb_add":
+        nick = clean_nick(text)
+        lb_add(nick)
+        ui().pop("await", None)
+        state.save()
+        try:
+            await update.message.delete()
+        except TelegramError:
+            pass
+        text, kb = await screen_lb(wait["chat"])
+        await show(context.bot, text + f"\nДобавил {lectures._esc(nick)}: пришлю только новые записи.", kb)
+
+
 # ─── Запуск ─────────────────────────────────────────────────────────────────
 
 def main():
@@ -2488,7 +2962,11 @@ def main():
     app.add_handler(CommandHandler("check", cmd_check))
     app.add_handler(CommandHandler("x", cmd_x))
     app.add_handler(CommandHandler("publish", cmd_publish))
+    app.add_handler(CommandHandler("menu", cmd_menu))
+    app.add_handler(CommandHandler("help", cmd_start))
+    app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST, channel_command))
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, on_text))
     log.info("Лента запущена, источники: %s", ", ".join(SOURCES))
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
