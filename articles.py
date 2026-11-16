@@ -388,9 +388,9 @@ def _meta(item):
                 about=src["about"], year=item["year"] or "год не указан", kind=kind, scope=src.get("scope", ""))
 
 
-def notes_prompt(item):
+def notes_prompt(item, prev_lines=None):
     return NOTES_PROMPT.format(**_meta(item), era=", ".join(america.TAGS_ERA), theme=", ".join(america.TAGS_THEME),
-                               text=item["text"][:40000])
+                               text=item["text"][:40000]) + lectures.prev_lines_text(prev_lines)
 
 
 def post_prompt(item, notes, quote_ru=None):

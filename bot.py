@@ -1554,7 +1554,7 @@ async def lecture_draft(bot, client, st):
         fid = lectures.fragment_id(cid, n, seg)
         total = len(st["lists"][cid])
         notes = lectures.parse_answer(await claude_json(
-            lectures.notes_prompt(course, n, total, lec, seg), LECTURES_MODEL, lectures.NOTES_SCHEMA,
+            lectures.notes_prompt(course, n, total, lec, seg, lines_of(st, fid)), LECTURES_MODEL, lectures.NOTES_SCHEMA,
             max_tokens=6000))
         if notes is None:
             raise RuntimeError("Claude не подготовил заметки к фрагменту")
@@ -1598,6 +1598,7 @@ async def lecture_write(client, cid, n, course, lec, seg, fid, total, notes):
     image = await lecture_image(client, notes.get("images"),
                                 "\n\n".join([post["title"], post["before"], post["after"]]))
     return {"fragment": fid, "course": cid, "title": post["title"], "tags": lectures.post_tags(post, course),
+            "point": notes.get("point"),
             "text": lectures.build_post(post, course, n, total, lec, seg, quote_ru, image=image),
             "preview": image["thumb"] if image else None}
 
@@ -1651,7 +1652,7 @@ async def publish_lecture(bot, client, channels, st, draft, today):
         st.pop("draft", None)  # иначе бот каждый раз пытался бы отправить тот же негодный черновик
         state.save()
         raise
-    st["used"].append(draft["fragment"])
+    mark_posted(st, draft["fragment"], draft.get("point"))
     st["posted"] = (st["posted"] + [{"fragment": draft["fragment"], "title": draft["title"], "date": today,
                                      "tags": draft["tags"]}])[-1000:]
     st["last_day"], st["last_course"] = today, draft["course"]
@@ -1712,6 +1713,25 @@ async def check_lectures(bot, force=False, preview=False):
                                                 "Попробую позже.")
         state.save()
         return 0
+
+# ─── Несколько постов с одного текста ───────────────────────────────────────
+
+MAX_LINES = 3  # больше трех постов с одного текста (по разным линиям) не делаем
+
+
+def lines_of(st, fragment):
+    return st.setdefault("lines", {}).get(fragment, [])
+
+
+def mark_posted(st, fragment, point):
+    """После поста текст не выбрасывается: запоминается линия, а в used он идет, только когда
+    линий набралось MAX_LINES (если других линий нет, заметки ответят skip и текст уйдет в used сам)."""
+    lines = st.setdefault("lines", {}).setdefault(fragment, [])
+    if point:
+        lines.append(str(point)[:300])
+    if len(lines) >= MAX_LINES and fragment not in st["used"]:
+        st["used"].append(fragment)
+
 
 # ─── Разнообразие тем ───────────────────────────────────────────────────────
 
@@ -1898,8 +1918,8 @@ async def article_draft(client, st):
         item = await article_candidate(client, st, sid, used)
         if not item:
             continue
-        notes = lectures.parse_answer(await claude_json(articles.notes_prompt(item), LECTURES_MODEL,
-                                                        lectures.NOTES_SCHEMA, max_tokens=6000))
+        notes = lectures.parse_answer(await claude_json(articles.notes_prompt(item, lines_of(st, item["fragment"])),
+                                                        LECTURES_MODEL, lectures.NOTES_SCHEMA, max_tokens=6000))
         if notes is None or notes.get("skip"):  # не о США, после 2014 года или без рассказа о прошлом
             log.info("Статьи: пропускаю %s", item["fragment"])
             st["used"].append(item["fragment"])
@@ -1935,6 +1955,7 @@ async def article_write(client, item, notes):
     image = await lecture_image(client, notes.get("images"),
                                 "\n\n".join([post["title"], post["before"], post["after"]]))
     return {"fragment": item.get("fragment", item["url"]), "source": item["source"], "title": post["title"],
+            "point": notes.get("point"),
             "tags": articles.post_tags(post, item),
             "text": articles.build_post(post, item, quote_ru, image),
             "preview": image["thumb"] if image else None}
@@ -1981,7 +2002,7 @@ async def check_articles(bot, force=False, preview=False):
                     st.pop("draft", None)  # следующая попытка сделает новый черновик, а не повторит этот
                     state.save()
                     raise
-                st["used"].append(draft["fragment"])
+                mark_posted(st, draft["fragment"], draft.get("point"))
                 st["posted"] = (st["posted"] + [{"fragment": draft["fragment"], "title": draft["title"],
                                                  "date": today, "tags": draft["tags"]}])[-1000:]
                 st["last_day"], st["last_source"] = today, draft["source"]

@@ -314,8 +314,21 @@ def _common(course, lecture_no, lecture, segment):
                 text=segment_text(lecture, segment)[:40000])
 
 
-def notes_prompt(course, lecture_no, lectures_total, lecture, segment):
+def prev_lines_text(lines):
+    """Строка для заметок: по каким линиям этого текста уже были посты."""
+    if not lines:
+        return ""
+    return ("\n\nПо этому тексту уже были посты, вот их линии:\n" + "\n".join(f"- {l}" for l in lines) +
+            "\nВыбери другую линию, не повторяя эти ни целиком, ни частично. Если другой цельной и интересной "
+            "линии в тексте нет, ответь skip: true.")
+
+
+def notes_prompt(course, lecture_no, lectures_total, lecture, segment, prev_lines=None):
     last = lecture["chapters"][-1] if lecture["chapters"] else None
+    return _notes_prompt_text(course, lecture_no, lectures_total, lecture, segment, last) + prev_lines_text(prev_lines)
+
+
+def _notes_prompt_text(course, lecture_no, lectures_total, lecture, segment, last):
     return NOTES_PROMPT.format(
         **_common(course, lecture_no, lecture, segment), lectures_total=lectures_total, outline=_outline(lecture),
         chapters=", ".join(str(n) for n in segment["chapters"]), minutes=segment_minutes(lecture, segment),
