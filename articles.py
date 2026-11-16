@@ -297,7 +297,7 @@ def parse_page(page, url, source_id):
 
 
 def pick_source(last_source=None):
-    ids = list(SOURCES)
+    ids = [s for s, v in SOURCES.items() if v.get("kind") != "series"]  # «Федералист» идет своей серией
     random.shuffle(ids)
     return sorted(ids, key=lambda s: s == last_source)
 

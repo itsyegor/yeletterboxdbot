@@ -174,7 +174,7 @@ class State:
 
     def channels(self, source):
         got = list(self.data["bindings"].get(source, []))
-        if not got and source in ("articles", "pictures", "federalist"):  # по умолчанию туда же, куда лекции
+        if not got and source in ("articles", "pictures", "federalist", "longreads"):  # по умолчанию туда же, куда лекции
             got = list(self.data["bindings"].get("lectures", []))
         return got
 
@@ -1667,8 +1667,7 @@ async def check_lectures(bot, force=False, preview=False):
         today = now.date().isoformat()
         if not preview:
             state.data["last"]["lectures"] = time.time()
-        if not force and (now.hour < LECTURES_HOUR or st.get("last_day") == today
-                          or "lectures" not in todays_slots(now.date())):
+        if not force:  # сами по расписанию не выходят: их вызывает общий котел длинных постов (check_longreads)
             state.save()
             return 0
         if not ANTHROPIC_API_KEY:
@@ -1749,15 +1748,27 @@ def topic_problem(tags):
 
 # ─── Расписание длинных постов ──────────────────────────────────────────────
 
+LONG_HOURS = [int(h) for h in os.environ.get("LONG_HOURS", "10,18").split(",")]  # часы длинных постов
+
+
+def federalist_day(day):
+    return day.weekday() == 5 and day.isocalendar()[1] % 2 == 0  # каждая вторая суббота
+
+
 def todays_slots(day):
-    """Что выходит в этот день. Выходные: два длинных поста (лекция и статья).
-    Будни: один длинный (через день лекция или статья) и одна картинка - времени читать меньше.
-    Раз в две недели в субботу вместо статьи - очередной «Федералист»."""
-    if day.weekday() == 5 and day.isocalendar()[1] % 2 == 0:  # каждая вторая суббота - «Федералист»
-        return {"lectures", "federalist"}
-    if day.weekday() >= 5:
-        return {"lectures", "articles"}
-    return {"lectures" if day.toordinal() % 2 == 0 else "articles", "pictures"}
+    """Что выходит в этот день, кроме длинных постов (их часы - long_hours).
+    Будни - картинка; раз в две недели в субботу - очередной «Федералист»."""
+    if federalist_day(day):
+        return {"federalist"}
+    return set() if day.weekday() >= 5 else {"pictures"}
+
+
+def long_hours(day):
+    """Часы длинных постов. Выходные - два (второй раз в две недели отдан «Федералисту»), будни - один:
+    времени читать меньше."""
+    if day.weekday() >= 5 and not federalist_day(day):
+        return LONG_HOURS[:2]
+    return LONG_HOURS[:1]
 
 
 # ─── Статьи ─────────────────────────────────────────────────────────────────
@@ -1913,8 +1924,7 @@ async def check_articles(bot, force=False, preview=False):
         today = now.date().isoformat()
         if not preview:
             state.data["last"]["articles"] = time.time()
-        if not force and (now.hour < ARTICLES_HOUR or st.get("last_day") == today
-                          or "articles" not in todays_slots(now.date())):
+        if not force:  # см. check_longreads
             state.save()
             return 0
         if not ANTHROPIC_API_KEY:
@@ -1964,6 +1974,41 @@ async def check_articles(bot, force=False, preview=False):
                                                 "Попробую позже.")
         state.save()
         return 0
+
+# ─── Длинные посты: общий котел ─────────────────────────────────────────────
+
+_long_lock = asyncio.Lock()
+
+
+async def check_longreads(bot, force=False, preview=False):
+    """Длинные посты из общего котла: лекции Йеля - один источник наравне с каждым источником статей.
+
+    В часы long_hours бот выпускает пост; источник выбирается случайно (лекции - с весом одного
+    источника из articles.SOURCES). Если лекции кончились или не вышли, берется статья.
+    """
+    async with _long_lock:
+        st = state.data.setdefault("longreads", {})
+        now = datetime.now(timezone(timedelta(hours=LECTURES_UTC_OFFSET)))
+        today = now.date().isoformat()
+        if st.get("day") != today:
+            st["day"], st["done"] = today, 0
+        if not preview:
+            state.data["last"]["longreads"] = time.time()
+        due = sum(h <= now.hour for h in long_hours(now.date()))
+        if not force and not preview and st["done"] >= due:
+            return 0
+        n_articles = len([s for s, v in articles.SOURCES.items() if v.get("kind") != "series"])
+        kinds = ["lectures", "articles"] if random.random() < 1 / (n_articles + 1) else ["articles", "lectures"]
+        for kind in kinds:
+            fn = check_lectures if kind == "lectures" else check_articles
+            n = await fn(bot, force=True, preview=preview)
+            if n:
+                if not preview:
+                    st["done"] += 1
+                    state.save()
+                return n
+        return 0
+
 
 # ─── «Федералист» ───────────────────────────────────────────────────────────
 
@@ -2175,10 +2220,13 @@ SOURCES = {
     "kanoner":    {"title": "Канонер: стройка и город, Петербург (посты из ВК)", "check": check_kanoner, "every": KANONER_INTERVAL},
     "america":    {"title": "Американистика: очные лекции о США и Канаде в Петербурге", "check": check_america,
                    "every": AMERICA_INTERVAL},
-    "lectures":   {"title": "Американистика: рассказы по лекциям Йеля", "check": check_lectures,
-                   "every": 1800},
+    "longreads":  {"title": "Американистика: длинные посты (будни - один, выходные - два) из общего котла: "
+                            "лекции Йеля и статьи", "check": check_longreads, "every": 1800},
+    "lectures":   {"title": "Американистика: лекции Йеля (выходят через longreads; /check - черновик)",
+                   "check": check_lectures, "every": 10 ** 9},
     "articles":   {"title": "Американистика: статьи, интервью Miller Center и подкаст Throughline (Prologue, Библиотека Конгресса, JSTOR Daily, "
-                            "American Heritage, Smithsonian, ADST, энциклопедии Арканзаса и Алабамы)", "check": check_articles, "every": 1800},
+                            "American Heritage, Smithsonian, ADST, энциклопедии Арканзаса и Алабамы; выходят через longreads)",
+                   "check": check_articles, "every": 10 ** 9},
     "pictures":   {"title": "Американистика: картинка с коротким текстом, по будням", "check": check_pictures,
                    "every": 1800},
     "federalist": {"title": "Американистика: «Федералист» по порядку, раз в две недели", "check": check_federalist,
@@ -2316,7 +2364,7 @@ async def cmd_remove(update, context):
 SOURCE_ALIASES = {  # /check и /publish понимают и русские названия
     "америка": "america", "анонсы": "america", "лекции": "lectures", "лекция": "lectures",
     "статьи": "articles", "статья": "articles", "картинки": "pictures", "картинка": "pictures",
-    "летербокс": "letterboxd", "федералист": "federalist", "светов": "svetov", "канонер": "kanoner",
+    "летербокс": "letterboxd", "федералист": "federalist", "длинные": "longreads", "светов": "svetov", "канонер": "kanoner",
 }
 
 
@@ -2342,7 +2390,7 @@ async def cmd_check(update, context):
         await update.message.reply_text(f"Проверяю {name}...")
         try:
             fn = SOURCES[name]["check"]
-            if name in ("lectures", "articles", "pictures", "federalist"):  # посты, которые пишет Claude, сначала владельцу
+            if name in ("lectures", "articles", "pictures", "federalist", "longreads"):  # посты, которые пишет Claude, сначала владельцу
                 n = await fn(context.bot, force=True, preview=True)
                 lines.append(f"{name}: черновиков {n}")
                 continue
