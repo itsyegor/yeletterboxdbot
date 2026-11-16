@@ -697,11 +697,8 @@ def fit_post(assemble, before, quote, after, limit=3900):
 
 def build_post(post, course, lecture_no, lectures_total, lecture, segment, quote_ru=None, limit=4000, image=None):
     """
-    🎓 ИЗ ЛЕКЦИИ
-    ▶️ Видео с 12:34 (~15 мин)
-
     Заголовок
-    Дэвид Блайт · Гражданская война и Реконструкция, 1845–1877 · Йель, 2008 · лекция 5 из 27
+    English Lecture Title (ссылка на расшифровку) · Дэвид Блайт · Йель, 2008 · ▶️ видео с 12:34, 15 мин
 
     Рассказ... [свернутая цитата лектора] ...рассказ
 
@@ -710,15 +707,13 @@ def build_post(post, course, lecture_no, lectures_total, lecture, segment, quote
     (картинка над постом)
     post - результат parse_post, теги - из заметок (post['tags']).
     """
-    links = []
+    # шапка: русский заголовок, под ним английское название лекции (ссылка на расшифровку), лектор и видео
     url = video_url(lecture, segment)
-    if url:
-        links.append(f'▶️ <a href="{_esc(url)}">Видео с {_clock(segment_start(lecture, segment))}</a> '
-                     f'(~{segment_minutes(lecture, segment)} мин)')
-    head = ["🎓 <b>ИЗ ЛЕКЦИИ</b>", " · ".join(links), "",
-            f"<b>{_esc(america._cut(_clean(post['title']), 200))}</b>",
-            f"<i>{_esc(course['author_full'])} · {_esc(course['title'])} · Йель, {course['year']} · "
-            f'<a href="{course["url"]}/lecture-{lecture_no}">лекция {lecture_no} из {lectures_total}</a></i>', ""]
+    video = (f' · <a href="{_esc(url)}">▶️ видео с {_clock(segment_start(lecture, segment))}, '
+             f'{segment_minutes(lecture, segment)} мин</a>' if url else "")
+    head = [f"<b>{_esc(america._cut(_clean(post['title']), 200))}</b>",
+            f'<i><a href="{course["url"]}/lecture-{lecture_no}">{_esc(lecture.get("title") or course["title"])}</a>'
+            f" · {_esc(course['author_full'])} · Йель, {course['year']}{video}</i>", ""]
     tags = " ".join("#" + t for t in post_tags(post, course))
 
     def assemble(before, q, after):

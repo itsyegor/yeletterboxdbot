@@ -271,7 +271,7 @@ def post_tags(post, item):
 def build_post(post, item, quote_ru=None, image=None, limit=4000):
     """
     Заголовок
-    Автор · Название (ссылка на оригинал) · Prologue · 2019
+    English Title (ссылка на оригинал) · Автор · Prologue · 2019
 
     Рассказ... [свернутая цитата] ...рассказ
     🖼 подпись к картинке · Wikimedia Commons
@@ -281,7 +281,7 @@ def build_post(post, item, quote_ru=None, image=None, limit=4000):
     esc, clean = lectures._esc, lectures._clean
     src = SOURCES[item["source"]]
     # английское название статьи - это и есть ссылка на оригинал
-    byline = " · ".join(x for x in [esc(item["author"]), f'<a href="{esc(item["url"])}">{esc(item["title"])}</a>',
+    byline = " · ".join(x for x in [f'<a href="{esc(item["url"])}">{esc(item["title"])}</a>', esc(item["author"]),
                                     esc(src["short"]), str(item["year"]) if item["year"] else ""] if x)
     head = [f"<b>{esc(america._cut(clean(post['title']), 200))}</b>", f"<i>{byline}</i>", ""]
     tags = " ".join("#" + t for t in post_tags(post, item))
