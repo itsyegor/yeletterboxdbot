@@ -1732,6 +1732,24 @@ def recent_topics(days=TOPIC_DAYS):
     return sorted(out, key=lambda x: x[0])
 
 
+# Теги, которые для читателя - одна тема: правило разнообразия считает их как одну
+TOPIC_CLUSTERS = [
+    {"рабство", "аболиционизм", "сегрегация", "гражданскиеправа"},
+    {"гражданскаявойна", "довоенныйкризис", "Реконструкция"},
+    {"президенты", "выборы", "партии"},
+    {"кино", "Голливуд"},
+    {"джаз", "музыка", "танец"},
+]
+CLUSTER_MAX = 1  # тема-кластер - не больше одного длинного поста за TOPIC_DAYS
+
+
+def cluster_of(tag):
+    for i, c in enumerate(TOPIC_CLUSTERS):
+        if tag in c:
+            return i
+    return None
+
+
 def topic_problem(tags):
     """Почему эти темы сейчас нежелательны, или None.
 
@@ -1748,6 +1766,10 @@ def topic_problem(tags):
         n = sum(t in r[2] for r in recent)
         if n >= TOPIC_MAX:
             return f"тема {t} за неделю была уже {n} раза"
+    for c in {cluster_of(t) for t in mine} - {None}:
+        n = sum(any(cluster_of(t) == c for t in r[2]) for r in longs)
+        if n >= CLUSTER_MAX:
+            return f"тема из группы {', '.join(sorted(TOPIC_CLUSTERS[c]))} за неделю уже была"
     return None
 
 
@@ -2710,7 +2732,8 @@ async def send_draft(bot, kind, draft):
                                [btn("🗑 Удалить", f"d:{kind}:del"), btn("✖ Закрыть", f"d:{kind}:close")]])
     msg = await bot.send_message(OWNER_ID, text=draft["text"], parse_mode=ParseMode.HTML,
                                  link_preview_options=lpo, reply_markup=kb)
-    ui()["draft_msgs"][kind] = msg.message_id
+    if msg is not None:
+        ui()["draft_msgs"][kind] = msg.message_id
     state.save()
 
 
