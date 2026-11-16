@@ -1516,6 +1516,7 @@ async def lecture_draft(bot, client, st):
     used = set(st["used"])
     if st.get("draft"):  # просили другой черновик - не повторяем прежний
         used.add(st["draft"]["fragment"])
+    fallback, deferred_n = None, 0
     for _ in range(6):
         choice = lectures.pick(list(lectures.COURSES), st["lists"], set(st["exhausted"]), st.get("last_course"))
         if not choice:
@@ -1550,29 +1551,43 @@ async def lecture_draft(bot, client, st):
             used.add(fid)
             state.save()
             continue
-        # цитата - до текста: автор поста должен знать, что в ней, чтобы не пересказывать то же самое
-        quote_ru = None
-        passages = lectures.extract_quotes(lectures.segment_text(lec, seg), notes.get("quote"))
-        if passages:
-            quote_ru = (await claude_text(lectures.translate_prompt(course, passages), LECTURES_MODEL,
-                                          max_tokens=5000)).strip() or None
-        elif notes.get("quote"):
-            log.info("Конспект %s: куски цитаты не нашлись в расшифровке: %r", fid, notes.get("quote"))
-        raw = await claude_text(lectures.post_prompt(course, n, lec, seg, notes, quote_ru), LECTURES_MODEL,
-                                max_tokens=5000)
-        # второй проход - редактор: раскрыть намеки, убрать лишнее и повторы цитаты, разбить длинные абзацы
-        edited = await claude_text(lectures.edit_prompt(raw, lectures.segment_text(lec, seg), quote_ru),
-                                   LECTURES_MODEL, max_tokens=5000)
-        post = lectures.parse_post(edited) or lectures.parse_post(raw)
-        if post is None:
-            raise RuntimeError("Claude не написал пост по заметкам")
-        post["tags"] = notes.get("tags")
-        image = await lecture_image(client, notes.get("images"),
-                                    "\n\n".join([post["title"], post["before"], post["after"]]))
-        return {"fragment": fid, "course": cid, "title": post["title"], "tags": lectures.post_tags(post, course),
-                "text": lectures.build_post(post, course, n, total, lec, seg, quote_ru, image=image),
-                "preview": image["thumb"] if image else None}
+        why = topic_problem(notes.get("tags"))
+        if why and deferred_n < TOPIC_RETRIES:  # откладываем, не тратя: фрагмент вернется в другой раз
+            log.info("Лекции: откладываю %s (%s)", fid, why)
+            fallback = fallback or (cid, n, course, lec, seg, fid, total, notes)
+            deferred_n += 1
+            used.add(fid)
+            continue
+        return await lecture_write(client, cid, n, course, lec, seg, fid, total, notes)
+    if fallback:  # все кандидаты с повторяющимися темами - берем первый из отложенных
+        return await lecture_write(client, *fallback)
     return None
+
+
+async def lecture_write(client, cid, n, course, lec, seg, fid, total, notes):
+    """Пишет пост по фрагменту лекции, для которого уже есть заметки."""
+    # цитата - до текста: автор поста должен знать, что в ней, чтобы не пересказывать то же самое
+    quote_ru = None
+    passages = lectures.extract_quotes(lectures.segment_text(lec, seg), notes.get("quote"))
+    if passages:
+        quote_ru = (await claude_text(lectures.translate_prompt(course, passages), LECTURES_MODEL,
+                                      max_tokens=5000)).strip() or None
+    elif notes.get("quote"):
+        log.info("Лекции %s: куски цитаты не нашлись в расшифровке: %r", fid, notes.get("quote"))
+    raw = await claude_text(lectures.post_prompt(course, n, lec, seg, notes, quote_ru), LECTURES_MODEL,
+                            max_tokens=5000)
+    # второй проход - редактор: раскрыть намеки, убрать лишнее и повторы цитаты, разбить длинные абзацы
+    edited = await claude_text(lectures.edit_prompt(raw, lectures.segment_text(lec, seg), quote_ru),
+                               LECTURES_MODEL, max_tokens=5000)
+    post = lectures.parse_post(edited) or lectures.parse_post(raw)
+    if post is None:
+        raise RuntimeError("Claude не написал пост по заметкам")
+    post["tags"] = notes.get("tags")
+    image = await lecture_image(client, notes.get("images"),
+                                "\n\n".join([post["title"], post["before"], post["after"]]))
+    return {"fragment": fid, "course": cid, "title": post["title"], "tags": lectures.post_tags(post, course),
+            "text": lectures.build_post(post, course, n, total, lec, seg, quote_ru, image=image),
+            "preview": image["thumb"] if image else None}
 
 
 async def lecture_image(client, queries, post_text):
@@ -1690,6 +1705,44 @@ async def check_lectures(bot, force=False, preview=False):
         state.save()
         return 0
 
+# ─── Разнообразие тем ───────────────────────────────────────────────────────
+
+TOPIC_DAYS = 7          # окно, за которое считаются темы
+TOPIC_MAX = 2           # тема - не больше стольких постов за окно
+TOPIC_RETRIES = 2       # сколько кандидатов отложить, прежде чем взять лучший из возможных
+
+
+def recent_topics(days=TOPIC_DAYS):
+    """Темы постов всех рубрик за последние дни: [(дата, рубрика, [теги])], от старых к новым."""
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).date().isoformat()
+    out = []
+    for kind in ("lectures", "articles", "pictures"):
+        for p in state.data.get(kind, {}).get("posted", []):
+            if p.get("date", "") >= since:
+                tags = p.get("tags") or [p.get("era"), p.get("theme")]
+                out.append((p["date"], kind, america.clean_tags([t for t in tags if t])))
+    return sorted(out, key=lambda x: x[0])
+
+
+def topic_problem(tags):
+    """Почему эти темы сейчас нежелательны, или None.
+
+    Нельзя: тема из предыдущего длинного поста; тема, которая за неделю была уже TOPIC_MAX раз.
+    """
+    mine = america.clean_tags(tags)[:2]
+    if not mine:
+        return None
+    recent = recent_topics()
+    longs = [r for r in recent if r[1] in ("lectures", "articles")]
+    if longs and set(mine) & set(longs[-1][2]):
+        return "тема как в прошлом длинном посте: " + ", ".join(sorted(set(mine) & set(longs[-1][2])))
+    for t in mine:
+        n = sum(t in r[2] for r in recent)
+        if n >= TOPIC_MAX:
+            return f"тема {t} за неделю была уже {n} раза"
+    return None
+
+
 # ─── Расписание длинных постов ──────────────────────────────────────────────
 
 def todays_slots(day):
@@ -1766,37 +1819,51 @@ async def article_draft(client, st):
     used = set(st["used"])
     if st.get("draft"):
         used.add(st["draft"]["fragment"])
+    fallback, deferred_n = None, 0
     for sid in articles.pick_source(st.get("last_source")) * 2:
         item = await article_candidate(client, st, sid, used)
         if not item:
             continue
         notes = lectures.parse_answer(await claude_json(articles.notes_prompt(item), LECTURES_MODEL,
                                                         lectures.NOTES_SCHEMA, max_tokens=6000))
-        if notes is None or notes.get("skip"):  # не об истории США, после 2014 года или пустая
+        if notes is None or notes.get("skip"):  # не о США, после 2014 года или без рассказа о прошлом
             log.info("Статьи: пропускаю %s", item["url"])
             st["used"].append(item["url"])
             used.add(item["url"])
             state.save()
             continue
-        quote_ru = None
-        passages = lectures.extract_quotes(item["text"], notes.get("quote"))
-        if passages:
-            quote_ru = (await claude_text(articles.translate_prompt(passages), LECTURES_MODEL,
-                                          max_tokens=5000)).strip() or None
-        raw = await claude_text(articles.post_prompt(item, notes, quote_ru), LECTURES_MODEL, max_tokens=5000)
-        edited = await claude_text(lectures.edit_prompt(raw, item["text"], quote_ru), LECTURES_MODEL,
-                                   max_tokens=5000)
-        post = lectures.parse_post(edited) or lectures.parse_post(raw)
-        if post is None:
-            raise RuntimeError("Claude не написал пост по статье")
-        post["tags"] = notes.get("tags")
-        image = await lecture_image(client, notes.get("images"),
-                                    "\n\n".join([post["title"], post["before"], post["after"]]))
-        return {"fragment": item["url"], "source": sid, "title": post["title"],
-                "tags": articles.post_tags(post, item),
-                "text": articles.build_post(post, item, quote_ru, image),
-                "preview": image["thumb"] if image else None}
+        why = topic_problem(notes.get("tags"))
+        if why and deferred_n < TOPIC_RETRIES:  # не в used: статья может выйти позже
+            log.info("Статьи: откладываю %s (%s)", item["url"], why)
+            fallback = fallback or (item, notes)
+            deferred_n += 1
+            used.add(item["url"])
+            continue
+        return await article_write(client, item, notes)
+    if fallback:
+        return await article_write(client, *fallback)
     return None
+
+
+async def article_write(client, item, notes):
+    quote_ru = None
+    passages = lectures.extract_quotes(item["text"], notes.get("quote"))
+    if passages:
+        quote_ru = (await claude_text(articles.translate_prompt(passages), LECTURES_MODEL,
+                                      max_tokens=5000)).strip() or None
+    raw = await claude_text(articles.post_prompt(item, notes, quote_ru), LECTURES_MODEL, max_tokens=5000)
+    edited = await claude_text(lectures.edit_prompt(raw, item["text"], quote_ru), LECTURES_MODEL,
+                               max_tokens=5000)
+    post = lectures.parse_post(edited) or lectures.parse_post(raw)
+    if post is None:
+        raise RuntimeError("Claude не написал пост по статье")
+    post["tags"] = notes.get("tags")
+    image = await lecture_image(client, notes.get("images"),
+                                "\n\n".join([post["title"], post["before"], post["after"]]))
+    return {"fragment": item["url"], "source": item["source"], "title": post["title"],
+            "tags": articles.post_tags(post, item),
+            "text": articles.build_post(post, item, quote_ru, image),
+            "preview": image["thumb"] if image else None}
 
 
 async def check_articles(bot, force=False, preview=False):
@@ -1869,8 +1936,8 @@ _pictures_lock = asyncio.Lock()
 
 async def picture_draft(client, st):
     used = set(st["used"])
-    recent = st["posted"][-12:]
-    era, theme = pictures.pick_theme([p.get("era") for p in recent] + [p.get("theme") for p in recent])
+    # эпоха и тема, которых не было за неделю ни в одной рубрике
+    era, theme = pictures.pick_theme([t for r in recent_topics() for t in r[2]])
     ideas = await claude_json(pictures.ideas_prompt(era, theme, [p["title"] for p in st["posted"]]),
                               LECTURES_MODEL, pictures.IDEAS_SCHEMA, max_tokens=600)
     cands, seen = [], set()
@@ -1911,6 +1978,7 @@ async def picture_draft(client, st):
     if post is None:
         raise RuntimeError("Claude не написал текст к картинке")
     return {"fragment": cand["title"], "title": post["title"], "era": era, "theme": theme,
+            "tags": america.clean_tags(ans.get("tags"))[:2],
             "text": pictures.build_post(post, cand, ans.get("tags")), "preview": cand["thumb"]}
 
 
@@ -1961,7 +2029,7 @@ async def check_pictures(bot, force=False, preview=False):
                 st["used"].append(draft["fragment"])
                 st["posted"] = (st["posted"] + [{"fragment": draft["fragment"], "title": draft["title"],
                                                  "era": draft["era"], "theme": draft["theme"],
-                                                 "date": today}])[-1000:]
+                                                 "tags": draft.get("tags"), "date": today}])[-1000:]
                 st["last_day"] = today
                 st.pop("draft", None)
                 state.save()
