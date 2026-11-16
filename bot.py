@@ -26,6 +26,8 @@ import json
 import html
 import time
 import asyncio
+import html as htmlmod
+import contextvars
 import logging
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone, timedelta
@@ -80,7 +82,7 @@ LECTURES_MODEL = os.environ.get("LECTURES_MODEL", "claude-sonnet-5-5")
 ARTICLES_HOUR = int(os.environ.get("ARTICLES_HOUR", "18"))
 PICTURES_HOUR = int(os.environ.get("PICTURES_HOUR", "14"))            # час картинки (только по будням)            # час публикации поста по статье
 LECTURES_HOUR = int(os.environ.get("LECTURES_HOUR", "10"))            # час публикации конспекта
-LECTURES_UTC_OFFSET = float(os.environ.get("LECTURES_UTC_OFFSET", "5"))  # Алматы
+LECTURES_UTC_OFFSET = float(os.environ.get("LECTURES_UTC_OFFSET", "3"))  # Петербург: и расписание, и время в меню
 
 # На случай, если Letterboxd не отдаст серверу страницу подписок
 DEFAULT_USERS = [
@@ -599,6 +601,29 @@ async def send_post(bot, client, chat_id, text_builder, images, preview_url=None
                       link_preview_options=LinkPreviewOptions(is_disabled=True))
 
 
+CURRENT_SOURCE = contextvars.ContextVar("current_source", default=None)  # чей пост сейчас публикуется
+
+
+def post_title(html_text):
+    """Первая строка поста без разметки - заголовок для меню."""
+    plain = re.sub(r"<[^>]+>", "", html_text or "")
+    for line in htmlmod.unescape(plain).splitlines():
+        line = line.strip()
+        if line:
+            return line[:90]
+    return ""
+
+
+def record_published(text):
+    """Пост действительно ушел в канал: время и заголовок - для «Последний» в меню."""
+    src = CURRENT_SOURCE.get()
+    if not src:
+        return
+    state.data.setdefault("published", {})[src] = {
+        "t": datetime.now(timezone.utc).isoformat(timespec="seconds"), "title": post_title(text)}
+    state.save()
+
+
 async def broadcast(bot, client, channels, text_builder, images, preview_url=None):
     """Один пост во все каналы источника. Ошибка в одном канале не мешает остальным."""
     sent = 0
@@ -613,6 +638,11 @@ async def broadcast(bot, client, channels, text_builder, images, preview_url=Non
                 sent += 1  # часть поста уже в канале: повторять целиком нельзя, будет дубль
     if channels and not sent:
         raise RuntimeError("пост не ушел ни в один канал")
+    if sent:
+        try:
+            record_published(text_builder(MESSAGE_LIMIT))
+        except Exception:
+            log.exception("Не записал время публикации")
 
 
 async def notify_owner(bot, key, text):
@@ -2292,6 +2322,7 @@ async def scheduler(app):
             if time.time() - state.data["last"].get(name, 0) < src["every"]:
                 continue
             try:
+                CURRENT_SOURCE.set(name)
                 await src["check"](app.bot)
             except Exception:
                 log.exception("Ошибка в источнике %s", name)
@@ -2310,7 +2341,7 @@ async def post_init(app):
             pass
     state.save()
     try:
-        await app.bot.set_my_commands([BotCommand("menu", "Меню"), BotCommand("help", "Справка по командам")])
+        await app.bot.set_my_commands([BotCommand("menu", "Меню")])
     except TelegramError:
         pass
     app.create_task(scheduler(app))
@@ -2332,6 +2363,11 @@ def sources_overview():
         where = ", ".join(f"«{state.title(c)}»" for c in chans) if chans else "не подключен"
         rows.append(f"• {name} — {src['title']}\n  каналы: {where}; проверка раз в {hours(src['every'])}")
     return "\n".join(rows)
+
+
+@owner_only
+async def cmd_help(update, context):
+    await update.message.reply_text("Все управление - в меню: кнопка «☰ Меню» внизу или /menu.")
 
 
 @owner_only
@@ -2436,6 +2472,7 @@ async def cmd_check(update, context):
             lines.append(f"{name}: не подключен к каналу")
             continue
         await update.message.reply_text(f"Проверяю {name}...")
+        CURRENT_SOURCE.set("longreads" if name in ("lectures", "articles") else name)
         try:
             fn = SOURCES[name]["check"]
             if name in ("lectures", "articles", "pictures", "federalist", "longreads"):  # посты, которые пишет Claude, сначала владельцу
@@ -2460,6 +2497,7 @@ async def cmd_publish(update, context):
     if not state.channels(name):
         await update.message.reply_text(f"{name} не подключен к каналу")
         return
+    CURRENT_SOURCE.set("longreads" if name in ("lectures", "articles") else name)
     try:
         n = await {"lectures": check_lectures, "articles": check_articles, "pictures": check_pictures,
                    "federalist": check_federalist}[name](context.bot, force=True)
@@ -2529,13 +2567,13 @@ async def channel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 MENU_BUTTON = "☰ Меню"
 
 RUBRICS = {  # что показывается в меню канала; ключ - источник из SOURCES
-    "longreads": {"title": "Длинные посты", "draft": True},
-    "pictures": {"title": "Картинки", "draft": True},
-    "federalist": {"title": "«Федералист»", "draft": True},
-    "america": {"title": "Анонсы лекций"},
-    "letterboxd": {"title": "Letterboxd"},
-    "svetov": {"title": "Светов"},
-    "kanoner": {"title": "Канонер"},
+    "longreads": {"title": "Длинные посты", "emoji": "📚", "draft": True},
+    "pictures": {"title": "Картинки", "emoji": "🖼", "draft": True},
+    "federalist": {"title": "«Федералист»", "emoji": "📜", "draft": True},
+    "america": {"title": "Анонсы лекций", "emoji": "🎟"},
+    "letterboxd": {"title": "Letterboxd", "emoji": "🎬"},
+    "svetov": {"title": "Светов", "emoji": "🍿"},
+    "kanoner": {"title": "Канонер", "emoji": "🏗"},
 }
 DRAFT_FN = {"longreads": lambda: check_longreads, "lectures": lambda: check_lectures,
             "articles": lambda: check_articles, "pictures": lambda: check_pictures,
@@ -2573,20 +2611,26 @@ def rubric_drafts(rubric):
 
 
 def last_posted(rubric):
-    """(дата, заголовок) последнего поста рубрики или None."""
-    logs = {"longreads": ["lectures", "articles"], "pictures": ["pictures"], "federalist": ["federalist"],
-            "america": ["america"]}.get(rubric)
-    if not logs:
+    """(время, заголовок) последней настоящей публикации рубрики в канал или None."""
+    p = state.data.get("published", {}).get(rubric)
+    if not p:
         return None
-    items = [p for k in logs for p in state.data.get(k, {}).get("posted", []) if p.get("date")]
-    if not items:
+    try:
+        t = datetime.fromisoformat(p["t"]).astimezone(timezone(timedelta(hours=LECTURES_UTC_OFFSET)))
+    except (KeyError, ValueError):
         return None
-    p = max(items, key=lambda p: p["date"])
-    return p["date"], p.get("title", "")
+    return t, p.get("title", "")
+
+
+def when(t):
+    """«сегодня 13:00», «вчера 18:00», «12.11, 07:40»."""
+    d = (t.date() - local_now().date()).days
+    hm = t.strftime("%H:%M")
+    return {0: f"сегодня {hm}", -1: f"вчера {hm}", 1: f"завтра {hm}"}.get(d, f"{t.strftime('%d.%m')}, {hm}")
 
 
 def next_slot(rubric):
-    """Когда рубрика выйдет в следующий раз (по расписанию), строкой."""
+    """Когда рубрика выйдет по расписанию (datetime) или None для рубрик, которые просто проверяют источник."""
     now = local_now()
     for d in range(0, 15):
         day = (now + timedelta(days=d)).date()
@@ -2597,83 +2641,116 @@ def next_slot(rubric):
         else:
             return None
         for h in hrs:
-            if d or h > now.hour:
-                when = "сегодня" if d == 0 else "завтра" if d == 1 else day.strftime("%d.%m")
-                return f"{when} {h}:00"
+            t = datetime.combine(day, datetime.min.time(), tzinfo=now.tzinfo).replace(hour=h)
+            if t > now:
+                return t
     return None
 
 
-def fmt_date(iso):
-    try:
-        return datetime.fromisoformat(iso).strftime("%d.%m")
-    except ValueError:
-        return iso
+def every_text(sec):
+    h = sec / 3600
+    if h < 1:
+        return f"каждые {round(sec / 60)} минут"
+    h = round(h)
+    return "каждый час" if h == 1 else f"каждые {h} {plural(h, 'час', 'часа', 'часов')}"
 
 
 def schedule_text(rubric):
     if rubric == "longreads":
         h = LONG_HOURS
-        return f"Будни — {h[0]}:00, выходные — " + " и ".join(f"{x}:00" for x in h[:2]) + " (по Алматы)"
+        return f"Будни в {h[0]}:00, выходные в " + " и ".join(f"{x}:00" for x in h[:2])
     if rubric == "pictures":
-        return f"Будни — {PICTURES_HOUR}:00 (по Алматы)"
+        return f"Будни в {PICTURES_HOUR}:00"
     if rubric == "federalist":
-        return f"Раз в две недели, суббота {ARTICLES_HOUR}:00 · следующий — № {state.data['federalist'].get('next', 1)}"
-    return f"Проверка раз в {hours(SOURCES[rubric]['every'])}"
+        return f"Раз в две недели, в субботу в {ARTICLES_HOUR}:00\nСледующий — № {state.data['federalist'].get('next', 1)}"
+    return "Проверка " + every_text(SOURCES[rubric]["every"])
+
+
+def rubric_name(rubric, bold=True):
+    info = RUBRICS[rubric]
+    name = f"<b>{info['title']}</b>" if bold else info["title"]
+    return f"{info['emoji']} {name}"
+
+
+def rubric_lines(rubric):
+    """Последний / следующий для экрана канала и экрана рубрики."""
+    paused = rubric in state.data.get("paused", [])
+    lines = []
+    last = last_posted(rubric)
+    if last:
+        lines.append(f"Последний: {when(last[0])}")
+    if paused:
+        lines.append("<i>На паузе</i>")
+    else:
+        nxt = next_slot(rubric)
+        if nxt:
+            lines.append(f"Следующий: {when(nxt)}")
+        elif rubric not in ("longreads", "pictures", "federalist"):
+            lines.append(f"<i>Проверка {every_text(SOURCES[rubric]['every'])}</i>")
+    return lines
+
+
+def channel_rubrics(chat_id):
+    return [r for r in RUBRICS if chat_id in state.channels(r)]
 
 
 def screen_main():
     rows = [[btn(state.title(c), f"c:{c}")] for c in all_channels()]
     n = len(state.data.get("notices", []))
     rows.append([btn(f"🔔 Уведомления ({n})" if n else "🔔 Уведомления", "nl")])
-    return "<b>Каналы</b>", InlineKeyboardMarkup(rows)
+    return "📢 <b>Каналы</b>", InlineKeyboardMarkup(rows)
 
 
 async def screen_channel(bot, chat_id):
-    title = state.title(chat_id)
+    rubrics = channel_rubrics(chat_id)
+    if len(rubrics) == 1:  # одна рубрика - сразу ее экран, без промежуточного
+        return screen_rubric(chat_id, rubrics[0])
+    head = [f"📢 <b>{lectures._esc(state.title(chat_id))}</b>"]
     try:
         members = await bot.get_chat_member_count(chat_id)
-        title += f" · {members} подписч."
+        head.append(f"<i>{members} {plural(members, 'подписчик', 'подписчика', 'подписчиков')}</i>")
     except TelegramError:
         pass
-    lines = [f"<b>{lectures._esc(title)}</b>", ""]
+    blocks = ["\n".join(head)]
     rows, pair = [], []
-    for r, info in RUBRICS.items():
-        if chat_id not in state.channels(r):
-            continue
-        mark = "⏸ " if r in state.data.get("paused", []) else ""
-        last = last_posted(r)
-        nxt = next_slot(r)
-        status = " · ".join(x for x in [
-            f"последний {fmt_date(last[0])}" if last else "",
-            f"следующий {nxt}" if nxt and not mark else ""] if x)
-        lines.append(f"{mark}{info['title']}" + (f" — {status}" if status else ""))
-        pair.append(btn(mark + info["title"], f"r:{chat_id}:{r}"))
+    for r in rubrics:
+        blocks.append("\n".join([rubric_name(r)] + rubric_lines(r)))
+        pair.append(btn(f"{RUBRICS[r]['emoji']} {RUBRICS[r]['title']}", f"r:{chat_id}:{r}"))
         if len(pair) == 2:
             rows.append(pair)
             pair = []
     if pair:
         rows.append(pair)
     rows.append([btn("‹ Назад", "m")])
-    return "\n".join(lines), InlineKeyboardMarkup(rows)
+    return "\n\n".join(blocks), InlineKeyboardMarkup(rows)
 
 
 def screen_rubric(chat_id, rubric):
     info = RUBRICS[rubric]
     paused = rubric in state.data.get("paused", [])
-    lines = [f"<b>{info['title']}</b>" + (" · на паузе" if paused else ""), schedule_text(rubric)]
+    blocks = [rubric_name(rubric) + f"\n<i>{schedule_text(rubric)}</i>"]
     last = last_posted(rubric)
+    lines = []
     if last:
-        lines.append(f"Последний: {fmt_date(last[0])}, «{lectures._esc(last[1][:80])}»")
-    nxt = next_slot(rubric)
-    if nxt and not paused:
-        lines.append(f"Следующий: {nxt}")
+        lines.append(f"Последний: {when(last[0])}")
+        if last[1]:
+            lines.append(f"<i>«{lectures._esc(last[1])}»</i>")
+    if paused:
+        lines.append("⏸ <b>На паузе</b>")
+    else:
+        nxt = next_slot(rubric)
+        if nxt:
+            lines.append(f"Следующий: {when(nxt)}")
+    if lines:
+        blocks.append("\n".join(lines))
     if rubric == "longreads":
-        week = recent_topics()
-        longs = [r for r in week if r[1] in LONG_KINDS]
+        longs = [r for r in recent_topics() if r[1] in LONG_KINDS]
         tags = sorted({t for r in longs for t in r[2]})
-        lines.append(f"За неделю: {len(longs)} · темы: " + (", ".join(tags[:8]) if tags else "—"))
+        n = len(longs)
+        blocks.append(f"За неделю: {n} {plural(n, 'пост', 'поста', 'постов')}" +
+                      ("\n" + " ".join("#" + t for t in tags[:10]) if tags else ""))
     if ui()["last_check"].get(rubric):
-        lines.append(ui()["last_check"][rubric])
+        blocks.append(f"<i>{lectures._esc(ui()['last_check'][rubric])}</i>")
     rows = []
     if info.get("draft"):
         if ui().get("busy", {}).get(rubric):
@@ -2686,9 +2763,9 @@ def screen_rubric(chat_id, rubric):
         rows.append([btn("🔄 Проверить сейчас", f"k:{chat_id}:{rubric}")])
     if rubric == "letterboxd":
         rows.append([btn("👥 Подписки", f"lb:{chat_id}")])
-    rows.append([btn("▶️ Возобновить" if paused else "⏸ Пауза", f"p:{chat_id}:{rubric}"),
-                 btn("‹ Назад", f"c:{chat_id}")])
-    return "\n".join(lines), InlineKeyboardMarkup(rows)
+    back = "m" if len(channel_rubrics(chat_id)) == 1 else f"c:{chat_id}"
+    rows.append([btn("▶️ Возобновить" if paused else "⏸ Пауза", f"p:{chat_id}:{rubric}"), btn("‹ Назад", back)])
+    return "\n\n".join(blocks), InlineKeyboardMarkup(rows)
 
 
 async def lb_users():
@@ -2781,6 +2858,7 @@ async def make_draft(bot, rubric, chat_id):
 
 
 async def run_check(bot, rubric, chat_id):
+    CURRENT_SOURCE.set(rubric)
     ui()["last_check"][rubric] = "⏳ Проверяю…"
     await show(bot, *screen_rubric(chat_id, rubric))
     try:
@@ -2865,6 +2943,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await q.answer("Этого черновика уже нет")
                 return
             await q.answer("Публикую…")
+            CURRENT_SOURCE.set(rubric)
             try:
                 n = await DRAFT_FN[dkind]()(bot, force=True)
             except Exception as e:
@@ -3007,7 +3086,7 @@ def main():
     app.add_handler(CommandHandler("x", cmd_x))
     app.add_handler(CommandHandler("publish", cmd_publish))
     app.add_handler(CommandHandler("menu", cmd_menu))
-    app.add_handler(CommandHandler("help", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST, channel_command))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, on_text))
