@@ -121,7 +121,7 @@ def parse_post(raw):
 def build_post(post, cand, tags):
     esc, clean = lectures._esc, lectures._clean
     credit = lectures.image_credit(cand)
-    tags = " ".join("#" + t for t in ["картинки"] + america.clean_tags(tags))
+    tags = " ".join("#" + t for t in ["картинки"] + america.clean_tags(tags)[:2])
     lines = [f"<b>{esc(clean(post['title']))}</b>", "", esc(clean(post["body"])), "",
              (f"<i>{esc(credit)}</i> · " if credit else "")
              + (f'<a href="{esc(cand["page"])}">Wikimedia Commons</a>' if cand.get("page") else ""),
